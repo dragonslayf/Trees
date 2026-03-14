@@ -5,6 +5,8 @@ import { ref, onMounted } from 'vue'
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000'
 
 const remoteDataPath = ref('')
+const selectedFiles = ref<File[]>([])
+const fileInputEl = ref<HTMLInputElement | null>(null)
 const dataDir = ref('')
 const files = ref<string[]>([])
 const thumbnailFilename = ref<string | null>(null)
@@ -71,6 +73,28 @@ function thumbnailDownloadUrl(): string {
   return `${API_BASE}/api/thumbnail/file?filename=${encodeURIComponent(name)}`
 }
 
+function openFilePicker() {
+  fileInputEl.value?.click()
+}
+
+function onFileSelected(event: Event) {
+  const input = event.target as HTMLInputElement
+  const list = input.files
+  if (!list?.length) return
+  selectedFiles.value = Array.from(list)
+  if (selectedFiles.value.length === 1) {
+    remoteDataPath.value = selectedFiles.value[0]?.name ?? ''
+  } else {
+    remoteDataPath.value = `已选择 ${selectedFiles.value.length} 个文件`
+  }
+  input.value = ''
+}
+
+function clearSelection() {
+  selectedFiles.value = []
+  remoteDataPath.value = ''
+}
+
 onMounted(async () => {
   const ok = await checkHealth()
   if (ok) await fetchList()
@@ -82,26 +106,38 @@ onMounted(async () => {
     <h1 class="page-title">📁 数据管理</h1>
 
     <section class="group">
-      <h2>后端连接</h2>
-      <div class="form-row">
-        <span class="status" :class="apiStatus">
-          {{ apiStatus === 'ok' ? '已连接' : apiStatus === 'error' ? '未连接' : '检测中…' }}
-        </span>
-        <span class="api-url muted">{{ API_BASE }}</span>
-        <button type="button" class="btn" @click="checkHealth">检测</button>
-        <button type="button" class="btn" @click="fetchList">刷新列表</button>
-      </div>
-      <p v-if="dataDir" class="muted small">数据目录: {{ dataDir }}</p>
-      <p v-if="error" class="error">{{ error }}</p>
-    </section>
-
-    <section class="group">
       <h2>数据导入</h2>
+      <input
+        ref="fileInputEl"
+        type="file"
+        class="file-input-hidden"
+        accept=".tif,.tiff,.geotiff,.png,.jpg,.jpeg,.las,.laz,.ply"
+        multiple
+        @change="onFileSelected"
+      />
       <div class="form-row">
         <label>图像数据:</label>
-        <input v-model="remoteDataPath" type="text" class="input" placeholder="选择遥感影像或点云数据..." />
-        <button type="button" class="btn">浏览</button>
+        <input
+          v-model="remoteDataPath"
+          type="text"
+          class="input"
+          placeholder="选择遥感影像或点云数据..."
+          readonly
+        />
+        <button type="button" class="btn" @click="openFilePicker">浏览</button>
+        <button
+          v-if="selectedFiles.length"
+          type="button"
+          class="btn btn-outline"
+          @click="clearSelection"
+        >
+          清除
+        </button>
       </div>
+      <p v-if="selectedFiles.length" class="selected-files muted small">
+        已选 {{ selectedFiles.length }} 个文件
+        <span v-for="f in selectedFiles" :key="f.name" class="file-tag">{{ f.name }}</span>
+      </p>
     </section>
 
     <section class="group">
@@ -181,6 +217,15 @@ onMounted(async () => {
   margin-top: 0.5rem;
 }
 
+.file-input-hidden {
+  position: absolute;
+  width: 0;
+  height: 0;
+  opacity: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
 .input {
   flex: 1;
   min-width: 200px;
@@ -216,6 +261,31 @@ onMounted(async () => {
 
 .btn-primary:hover:not(:disabled) {
   background: #3d6a4d;
+}
+
+.btn-outline {
+  background: transparent;
+  border: 1px solid #555;
+}
+
+.btn-outline:hover {
+  background: #3c3f41;
+}
+
+.selected-files {
+  margin-top: 0.5rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.file-tag {
+  display: inline-block;
+  padding: 2px 8px;
+  background: #2b2b2b;
+  border-radius: 4px;
+  font-size: 0.85rem;
 }
 
 .status {
