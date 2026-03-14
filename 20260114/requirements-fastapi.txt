@@ -1,0 +1,11 @@
+# FastAPI 示例依赖（与 create_dom_thumbnail 的 rasterio 等分开装也可）
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+python-multipart>=0.0.6
+
+# 缩略图转 PNG 预览用
+Pillow>=10.0.0
+
+# 若尚未安装缩略图脚本依赖
+# rasterio>=1.3.0
+# numpy>=1.24.0
