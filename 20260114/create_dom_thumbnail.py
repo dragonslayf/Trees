@@ -84,10 +84,7 @@ def create_dom_thumbnail(
 
 
 if __name__ == "__main__":
-    """
-    直接运行：使用脚本所在目录下的 DOMZone48.tif，
-    生成 800×800 缩略图 GeoTIFF。
-    """
+
     base_dir = Path(__file__).resolve().parent
     output_path = create_dom_thumbnail(base_dir)
     print(f"缩略图已生成: {output_path}")

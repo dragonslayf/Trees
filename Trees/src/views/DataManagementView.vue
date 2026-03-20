@@ -1,15 +1,22 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 
-// 后端 API 地址（可改为 .env 中 VITE_API_BASE_URL）
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000'
 
-const remoteDataPath = ref('')
-const selectedFiles = ref<File[]>([])
-const fileInputEl = ref<HTMLInputElement | null>(null)
-const dataDir = ref('')
-const files = ref<string[]>([])
+const domFile = ref<File | null>(null)
+const chmFile = ref<File | null>(null)
+const csvFile = ref<File | null>(null)
+
+const domInputRef = ref<HTMLInputElement | null>(null)
+const chmInputRef = ref<HTMLInputElement | null>(null)
+const csvInputRef = ref<HTMLInputElement | null>(null)
+
+const domDragOver = ref(false)
+const chmDragOver = ref(false)
+const csvDragOver = ref(false)
+
 const thumbnailFilename = ref<string | null>(null)
+const thumbnailDataDir = ref<string | null>(null)
 const previewKey = ref(0)
 const loading = ref(false)
 const error = ref('')
@@ -26,36 +33,23 @@ async function checkHealth() {
   }
 }
 
-async function fetchList() {
-  error.value = ''
-  try {
-    const r = await fetch(`${API_BASE}/api/data/list`)
-    if (!r.ok) throw new Error(await r.text())
-    const data = await r.json()
-    dataDir.value = data.data_dir ?? ''
-    files.value = data.files ?? []
-    thumbnailFilename.value = files.value.includes('DOMZone48_thumb_800x800.tif')
-      ? 'DOMZone48_thumb_800x800.tif'
-      : null
-  } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e)
-    files.value = []
-    thumbnailFilename.value = null
-  }
+function selectedDomFilename(): string | null {
+  return domFile.value?.name ?? null
 }
 
 async function generateThumbnail() {
   loading.value = true
   error.value = ''
+  const domFilename = selectedDomFilename()
   try {
-    const r = await fetch(`${API_BASE}/api/thumbnail/generate?thumb_size=800`, {
-      method: 'POST',
-    })
+    const params = new URLSearchParams({ thumb_size: '800' })
+    if (domFilename) params.set('dom_filename', domFilename)
+    const r = await fetch(`${API_BASE}/api/thumbnail/generate?${params}`, { method: 'POST' })
     const data = await r.json().catch(() => ({}))
     if (!r.ok) throw new Error(data.detail ?? r.statusText)
     thumbnailFilename.value = data.filename ?? 'DOMZone48_thumb_800x800.tif'
+    thumbnailDataDir.value = data.data_dir ?? null
     previewKey.value = Date.now()
-    await fetchList()
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
   } finally {
@@ -64,40 +58,87 @@ async function generateThumbnail() {
 }
 
 function thumbnailPreviewUrl(): string {
-  const t = thumbnailFilename.value ? `?t=${previewKey.value}` : ''
-  return `${API_BASE}/api/thumbnail/preview.png${t}`
+  const params = new URLSearchParams()
+  if (thumbnailFilename.value) params.set('filename', thumbnailFilename.value)
+  if (thumbnailDataDir.value) params.set('data_dir', thumbnailDataDir.value)
+  params.set('t', String(previewKey.value))
+  return `${API_BASE}/api/thumbnail/preview.png?${params}`
 }
 
 function thumbnailDownloadUrl(): string {
-  const name = thumbnailFilename.value ?? 'DOMZone48_thumb_800x800.tif'
-  return `${API_BASE}/api/thumbnail/file?filename=${encodeURIComponent(name)}`
+  const params = new URLSearchParams()
+  params.set('filename', thumbnailFilename.value ?? 'DOMZone48_thumb_800x800.tif')
+  if (thumbnailDataDir.value) params.set('data_dir', thumbnailDataDir.value)
+  return `${API_BASE}/api/thumbnail/file?${params}`
 }
 
-function openFilePicker() {
-  fileInputEl.value?.click()
+function openDomPicker() {
+  domInputRef.value?.click()
+}
+function openChmPicker() {
+  chmInputRef.value?.click()
+}
+function openCsvPicker() {
+  csvInputRef.value?.click()
 }
 
-function onFileSelected(event: Event) {
-  const input = event.target as HTMLInputElement
-  const list = input.files
-  if (!list?.length) return
-  selectedFiles.value = Array.from(list)
-  if (selectedFiles.value.length === 1) {
-    remoteDataPath.value = selectedFiles.value[0]?.name ?? ''
-  } else {
-    remoteDataPath.value = `已选择 ${selectedFiles.value.length} 个文件`
-  }
+function setDomFile(file: File | null) {
+  domFile.value = file
+}
+function setChmFile(file: File | null) {
+  chmFile.value = file
+}
+function setCsvFile(file: File | null) {
+  csvFile.value = file
+}
+
+function onDomInputChange(e: Event) {
+  const input = e.target as HTMLInputElement
+  const f = input.files?.[0]
+  setDomFile(f ?? null)
+  input.value = ''
+}
+function onChmInputChange(e: Event) {
+  const input = e.target as HTMLInputElement
+  const f = input.files?.[0]
+  setChmFile(f ?? null)
+  input.value = ''
+}
+function onCsvInputChange(e: Event) {
+  const input = e.target as HTMLInputElement
+  const f = input.files?.[0]
+  setCsvFile(f ?? null)
   input.value = ''
 }
 
-function clearSelection() {
-  selectedFiles.value = []
-  remoteDataPath.value = ''
+function allowTif(file: File) {
+  const n = file.name.toLowerCase()
+  return n.endsWith('.tif') || n.endsWith('.tiff')
+}
+function allowCsv(file: File) {
+  return file.name.toLowerCase().endsWith('.csv')
 }
 
-onMounted(async () => {
-  const ok = await checkHealth()
-  if (ok) await fetchList()
+function onDomDrop(e: DragEvent) {
+  domDragOver.value = false
+  const f = e.dataTransfer?.files?.[0]
+  if (f && allowTif(f)) setDomFile(f)
+}
+
+function onChmDrop(e: DragEvent) {
+  chmDragOver.value = false
+  const f = e.dataTransfer?.files?.[0]
+  if (f && allowTif(f)) setChmFile(f)
+}
+
+function onCsvDrop(e: DragEvent) {
+  csvDragOver.value = false
+  const f = e.dataTransfer?.files?.[0]
+  if (f && allowCsv(f)) setCsvFile(f)
+}
+
+onMounted(() => {
+  checkHealth()
 })
 </script>
 
@@ -106,75 +147,109 @@ onMounted(async () => {
     <h1 class="page-title">📁 数据管理</h1>
 
     <section class="group">
-      <h2>数据导入</h2>
+      <h2>DOM影像</h2>
       <input
-        ref="fileInputEl"
+        ref="domInputRef"
         type="file"
         class="file-input-hidden"
-        accept=".tif,.tiff,.geotiff,.png,.jpg,.jpeg,.las,.laz,.ply"
-        multiple
-        @change="onFileSelected"
+        accept=".tif,.tiff"
+        @change="onDomInputChange"
       />
-      <div class="form-row">
-        <label>图像数据:</label>
-        <input
-          v-model="remoteDataPath"
-          type="text"
-          class="input"
-          placeholder="选择遥感影像或点云数据..."
-          readonly
-        />
-        <button type="button" class="btn" @click="openFilePicker">浏览</button>
-        <button
-          v-if="selectedFiles.length"
-          type="button"
-          class="btn btn-outline"
-          @click="clearSelection"
-        >
-          清除
-        </button>
+      <div
+        class="drop-zone"
+        :class="{ 'drop-zone-active': domDragOver, 'drop-zone-filled': domFile }"
+        @click="openDomPicker()"
+        @dragover.prevent="domDragOver = true"
+        @dragleave="domDragOver = false"
+        @drop.prevent="onDomDrop"
+      >
+        <template v-if="domFile">
+          <span class="drop-zone-file">{{ domFile.name }}</span>
+        </template>
+        <template v-else>
+          <span class="drop-zone-hint">拖拽上传</span>
+          <span class="drop-zone-sub">或点击选择 .tif</span>
+        </template>
       </div>
-      <p v-if="selectedFiles.length" class="selected-files muted small">
-        已选 {{ selectedFiles.length }} 个文件
-        <span v-for="f in selectedFiles" :key="f.name" class="file-tag">{{ f.name }}</span>
-      </p>
     </section>
 
     <section class="group">
-      <h2>数据文件列表</h2>
-      <p v-if="apiStatus !== 'ok'" class="muted">请先启动 FastAPI 服务（uvicorn fastapi_example:app --port 8000）并刷新。</p>
-      <ul v-else-if="files.length" class="file-list">
-        <li v-for="f in files" :key="f">{{ f }}</li>
-      </ul>
-      <p v-else class="muted">暂无 .tif / .tfw / .ovr 等文件。</p>
-      <div class="form-row actions">
-        <button
-          type="button"
-          class="btn btn-primary"
-          :disabled="loading || apiStatus !== 'ok'"
-          @click="generateThumbnail"
-        >
-          {{ loading ? '生成中…' : '生成 DOM 缩略图 (800×800)' }}
-        </button>
+      <h2>CHM影像</h2>
+      <input
+        ref="chmInputRef"
+        type="file"
+        class="file-input-hidden"
+        accept=".tif,.tiff"
+        @change="onChmInputChange"
+      />
+      <div
+        class="drop-zone"
+        :class="{ 'drop-zone-active': chmDragOver, 'drop-zone-filled': chmFile }"
+        @click="openChmPicker()"
+        @dragover.prevent="chmDragOver = true"
+        @dragleave="chmDragOver = false"
+        @drop.prevent="onChmDrop"
+      >
+        <template v-if="chmFile">
+          <span class="drop-zone-file">{{ chmFile.name }}</span>
+        </template>
+        <template v-else>
+          <span class="drop-zone-hint">拖拽上传</span>
+          <span class="drop-zone-sub">或点击选择 .tif</span>
+        </template>
       </div>
+    </section>
+
+    <section class="group">
+      <h2>经纬度CSV</h2>
+      <input
+        ref="csvInputRef"
+        type="file"
+        class="file-input-hidden"
+        accept=".csv"
+        @change="onCsvInputChange"
+      />
+      <div
+        class="drop-zone"
+        :class="{ 'drop-zone-active': csvDragOver, 'drop-zone-filled': csvFile }"
+        @click="openCsvPicker()"
+        @dragover.prevent="csvDragOver = true"
+        @dragleave="csvDragOver = false"
+        @drop.prevent="onCsvDrop"
+      >
+        <template v-if="csvFile">
+          <span class="drop-zone-file">{{ csvFile.name }}</span>
+        </template>
+        <template v-else>
+          <span class="drop-zone-hint">拖拽上传</span>
+          <span class="drop-zone-sub">或点击选择 .csv</span>
+        </template>
+      </div>
+    </section>
+
+    <section class="group actions-row">
+      <button
+        type="button"
+        class="btn btn-primary"
+        :disabled="loading || apiStatus !== 'ok'"
+        @click="generateThumbnail"
+      >
+        {{ loading ? '生成中…' : '生成 DOM 缩略图 (800×800)' }}
+      </button>
+      <p v-if="error" class="error">{{ error }}</p>
     </section>
 
     <section class="group">
       <h2>数据预览</h2>
       <div class="preview-area">
         <template v-if="thumbnailFilename">
-          <img
-            :src="thumbnailPreviewUrl()"
-            alt="DOM 缩略图"
-            class="preview-img"
-          />
+          <img :src="thumbnailPreviewUrl()" alt="DOM 缩略图" class="preview-img" />
           <p class="preview-actions">
             <a :href="thumbnailDownloadUrl()" target="_blank" rel="noopener" class="link">下载 TIFF 缩略图</a>
           </p>
         </template>
         <template v-else>
-          <p>图像数据预览区域</p>
-          <p class="muted">请先点击「生成 DOM 缩略图」或确保 20260114 目录下已有 DOMZone48.tif。</p>
+          <p class="muted">请先选择 DOM 影像并点击「生成 DOM 缩略图」。</p>
         </template>
       </div>
     </section>
@@ -202,21 +277,6 @@ onMounted(async () => {
   padding: 0 4px;
 }
 
-.form-row {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  flex-wrap: wrap;
-}
-
-.form-row label {
-  min-width: 80px;
-}
-
-.form-row.actions {
-  margin-top: 0.5rem;
-}
-
 .file-input-hidden {
   position: absolute;
   width: 0;
@@ -226,14 +286,58 @@ onMounted(async () => {
   pointer-events: none;
 }
 
-.input {
-  flex: 1;
-  min-width: 200px;
-  padding: 8px 12px;
+.drop-zone {
+  min-height: 88px;
+  border: 2px dashed #555;
+  border-radius: 8px;
   background: #2b2b2b;
-  border: 1px solid #555;
-  border-radius: 4px;
-  color: #fff;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25rem;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.drop-zone:hover {
+  border-color: #666;
+  background: #333;
+}
+
+.drop-zone-active {
+  border-color: #4a5b7c;
+  background: #363d4a;
+}
+
+.drop-zone-filled {
+  border-style: solid;
+  border-color: #555;
+}
+
+.drop-zone-hint {
+  font-size: 0.95rem;
+  color: #ccc;
+}
+
+.drop-zone-sub {
+  font-size: 0.85rem;
+  color: #888;
+}
+
+.drop-zone-file {
+  font-size: 0.9rem;
+  color: #c8e6c9;
+  word-break: break-all;
+  text-align: center;
+  padding: 0 0.5rem;
+}
+
+.actions-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
 }
 
 .btn {
@@ -263,78 +367,13 @@ onMounted(async () => {
   background: #3d6a4d;
 }
 
-.btn-outline {
-  background: transparent;
-  border: 1px solid #555;
-}
-
-.btn-outline:hover {
-  background: #3c3f41;
-}
-
-.selected-files {
-  margin-top: 0.5rem;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.5rem;
-}
-
-.file-tag {
-  display: inline-block;
-  padding: 2px 8px;
-  background: #2b2b2b;
-  border-radius: 4px;
-  font-size: 0.85rem;
-}
-
-.status {
-  padding: 4px 8px;
-  border-radius: 4px;
-  font-size: 0.9rem;
-}
-
-.status.ok {
-  background: #2d5a3d;
-  color: #c8e6c9;
-}
-
-.status.error {
-  background: #5a2d2d;
-  color: #ffcdd2;
-}
-
-.api-url {
-  font-size: 0.85rem;
-}
-
 .muted {
   color: #888;
   font-size: 0.9rem;
 }
 
-.small {
-  font-size: 0.85rem;
-}
-
 .error {
   color: #f44336;
-  margin-top: 0.5rem;
-}
-
-.file-list {
-  list-style: none;
-  padding: 0;
-  margin: 0 0 0.5rem 0;
-  max-height: 160px;
-  overflow-y: auto;
-  background: #2b2b2b;
-  padding: 8px;
-  border-radius: 4px;
-}
-
-.file-list li {
-  padding: 2px 0;
   font-size: 0.9rem;
 }
 

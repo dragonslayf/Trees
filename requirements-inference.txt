@@ -1,0 +1,10 @@
+# Larch 实例分割推理依赖（inference_larch.py）
+# 需在已安装 MMDetection 及 TreeNet/TREEFPN 代码的环境下使用
+
+# 读取 .tif 二选一即可
+rasterio>=1.3.0
+# 或 opencv-python>=4.5.0
+
+numpy>=1.19.0
+
+# MMDetection 及自定义模块需单独安装（含 TreeNet、TREEFPN、CascadeRoIHead 等）

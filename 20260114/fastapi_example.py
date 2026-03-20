@@ -54,18 +54,38 @@ def health():
     return {"status": "ok"}
 
 
+def _resolve_data_dir(data_dir: str | None) -> Path:
+    """请求使用的数据目录：未传则用默认 DATA_DIR，否则解析为绝对路径（可传相对路径，相对当前工作目录）。"""
+    if not data_dir or not data_dir.strip():
+        return DATA_DIR
+    p = Path(data_dir).resolve()
+    return p if p.is_dir() else DATA_DIR
+
+
 @app.post("/api/thumbnail/generate")
-def generate_thumbnail(thumb_size: int = 800):
+def generate_thumbnail(
+    thumb_size: int = 800,
+    dom_filename: str | None = None,
+    data_dir: str | None = None,
+):
     """
-    调用 create_dom_thumbnail，在 DATA_DIR 下生成 DOM 缩略图。
-    影像较大时可能较慢，生产环境建议异步任务 + 轮询/回调。
+    调用 create_dom_thumbnail 生成 DOM 缩略图。
+    - dom_filename: 使用的 DOM 文件名（如 DOMZone48.tif），不传则用默认。
+    - data_dir: 数据目录（服务器路径），不传则用默认 DATA_DIR。
     """
+    use_data_dir = _resolve_data_dir(data_dir)
+    use_dom = (dom_filename or "").strip() or "DOMZone48.tif"
     try:
-        out_path = create_dom_thumbnail(DATA_DIR, thumb_size=thumb_size)
+        out_path = create_dom_thumbnail(
+            use_data_dir,
+            dom_filename=use_dom,
+            thumb_size=thumb_size,
+        )
         return {
             "ok": True,
             "path": str(out_path),
             "filename": out_path.name,
+            "data_dir": str(use_data_dir),
         }
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -74,11 +94,15 @@ def generate_thumbnail(thumb_size: int = 800):
 
 
 @app.get("/api/thumbnail/file")
-def download_thumbnail(filename: str = "DOMZone48_thumb_800x800.tif"):
+def download_thumbnail(
+    filename: str = "DOMZone48_thumb_800x800.tif",
+    data_dir: str | None = None,
+):
     """
-    若已生成缩略图，直接返回 TIFF 文件下载。
+    若已生成缩略图，直接返回 TIFF 文件下载。可选 data_dir 指定服务器上的数据目录。
     """
-    path = DATA_DIR / filename
+    use_dir = _resolve_data_dir(data_dir)
+    path = use_dir / filename
     if not path.is_file():
         raise HTTPException(status_code=404, detail=f"文件不存在: {filename}")
     return FileResponse(
@@ -89,9 +113,9 @@ def download_thumbnail(filename: str = "DOMZone48_thumb_800x800.tif"):
 
 
 @app.get("/api/thumbnail/preview.png")
-def thumbnail_preview_png():
+def thumbnail_preview_png(filename: str | None = None, data_dir: str | None = None):
     """
-    返回缩略图的 PNG 预览，供前端 <img src="..."> 显示（浏览器不直接支持 TIFF）。
+    返回缩略图的 PNG 预览。可选 filename、data_dir 与生成时一致。
     """
     import rasterio
     import numpy as np
@@ -102,8 +126,9 @@ def thumbnail_preview_png():
             status_code=500,
             detail="需要安装 Pillow: pip install Pillow",
         )
-    filename = "DOMZone48_thumb_800x800.tif"
-    path = DATA_DIR / filename
+    use_dir = _resolve_data_dir(data_dir)
+    thumb_name = (filename or "").strip() or "DOMZone48_thumb_800x800.tif"
+    path = use_dir / thumb_name
     if not path.is_file():
         raise HTTPException(status_code=404, detail="请先调用 POST /api/thumbnail/generate 生成缩略图")
     with rasterio.open(path) as src:
@@ -134,12 +159,14 @@ def thumbnail_preview_png():
 
 # 可选：用 JSON 列出目录下与 DOM 相关的文件
 @app.get("/api/data/list")
-def list_data_files():
+def list_data_files(data_dir: str | None = None):
+    """列出数据目录中的影像相关文件。可选 data_dir 指定服务器上的数据目录。"""
+    use_dir = _resolve_data_dir(data_dir)
     patterns = ("*.tif", "*.tfw", "*.ovr", "*.aux.xml")
     files = []
     for p in patterns:
-        files.extend([f.name for f in DATA_DIR.glob(p)])
-    return {"data_dir": str(DATA_DIR), "files": sorted(set(files))}
+        files.extend([f.name for f in use_dir.glob(p)])
+    return {"data_dir": str(use_dir), "files": sorted(set(files))}
 
 
 if __name__ == "__main__":
