@@ -9,16 +9,35 @@ from mmcv.cnn import ConvModule
 from mmcv.ops.merge_cells import GlobalPoolingCell, SumCell, ConcatCell
 from mmcv.runner import BaseModule, ModuleList
 
-from ..utils.se_layer import SELayer
-from ..utils.mulse_layer import BiSELayer, MSSELayer
-from ..utils.CBAM_layer import CBAM
-from ..utils.mulCBAM_layer import BBCBAM, BMCBAM, MMCBAM, MBCBAM
+from se_layer import SELayer
+# from ..utils.mulse_layer import BiSELayer, MSSELayer
+# from ..utils.CBAM_layer import CBAM
+# from ..utils.mulCBAM_layer import BBCBAM, BMCBAM, MMCBAM, MBCBAM
 
-from ..builder import NECKS
+# from ..builder import NECKS
+# from ..builder import NECKS
 
-# eps=0.0001
+def _register_tree_fpn():
+    """注册到 MMDetection 2.x（NECKS）或 3.x（MODELS），未安装 mmdet 时静默跳过。"""
+    try:
+        from mmdet.registry import MODELS
 
-@NECKS.register_module()
+        if 'TREEFPN' not in MODELS.module_dict:
+            MODELS.register_module(name='TREEFPN', module=TREEFPN)
+        return
+    except (ImportError, AttributeError):
+        pass
+    try:
+        from mmdet.models.builder import NECKS as _REG
+    except (ImportError, AttributeError):
+        try:
+            from mmdet.models import NECKS as _REG
+        except (ImportError, AttributeError):
+            return
+    if 'TREEFPN' not in _REG.module_dict:
+        _REG.register_module(module=TREEFPN)
+
+
 class TREEFPN(BaseModule):
     """TREEFPN.
 
@@ -315,3 +334,6 @@ class TREEFPN(BaseModule):
         return feats[:self.num_outs]
 
         # return p3, p4, p5, p6, p7
+
+
+_register_tree_fpn()

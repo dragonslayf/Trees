@@ -9,11 +9,30 @@ from mmcv.runner import BaseModule
 from torch.nn.modules.batchnorm import _BatchNorm
 from torch import nn
 
-# from ..builder import BACKBONES
 from inverted_residual import InvertedResidual
 
 
-# @BACKBONES.register_module()
+def _register_tree_net():
+    """注册到 MMDetection 2.x（BACKBONES）或 3.x（MODELS），未安装 mmdet 时静默跳过。"""
+    try:
+        from mmdet.registry import MODELS
+
+        if 'TreeNet' not in MODELS.module_dict:
+            MODELS.register_module(name='TreeNet', module=TreeNet)
+        return
+    except (ImportError, AttributeError):
+        pass
+    try:
+        from mmdet.models.builder import BACKBONES as _REG
+    except (ImportError, AttributeError):
+        try:
+            from mmdet.models import BACKBONES as _REG
+        except (ImportError, AttributeError):
+            return
+    if 'TreeNet' not in _REG.module_dict:
+        _REG.register_module(module=TreeNet)
+
+
 class TreeNet(BaseModule):
     """TreeNet backbone.
 
@@ -243,3 +262,6 @@ class TreeNet(BaseModule):
             for m in self.modules():
                 if isinstance(m, _BatchNorm):
                     m.eval()
+
+
+_register_tree_net()

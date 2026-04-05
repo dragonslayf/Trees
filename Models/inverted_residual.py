@@ -1,14 +1,19 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-import torch.utils.checkpoint as cp
-from mmcv.cnn import ConvModule, build_conv_layer, build_norm_layer, build_activation_layer
-from mmcv.runner import BaseModule
-from torch import nn
-
-from .se_layer import SELayer
-from .mulse_layer import BiSELayer, MSSELayer
-from .CBAM_layer import CBAM
-from .mulCBAM_layer import BBCBAM, BMCBAM, MMCBAM, MBCBAM
 import torch
+import torch.nn as nn
+import torch.utils.checkpoint as cp
+from mmcv.cnn import (
+    ConvModule,
+    build_activation_layer,
+    build_conv_layer,
+    build_norm_layer,
+)
+from mmcv.runner import BaseModule
+
+from se_layer import SELayer
+# from .mulse_layer import BiSELayer, MSSELayer
+# from CBAM_layer import CBAM
+# from mulCBAM_layer import BBCBAM, BMCBAM, MMCBAM, MBCBAM
 
 class InvertedResidual(BaseModule):
     """Inverted Residual Block.

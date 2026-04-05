@@ -1,3 +1,13 @@
+# 将仓库根目录 Trees/ 加入 path，以便 custom_imports 能加载 mmdet_custom_models
+import sys
+from pathlib import Path
+
+_trees_root = Path(__file__).resolve().parent.parent
+if str(_trees_root) not in sys.path:
+    sys.path.insert(0, str(_trees_root))
+
+custom_imports = dict(imports=['mmdet_custom_models'], allow_failed_imports=False)
+
 model = dict(
     type='TwoStageDetector',
     backbone=dict(
