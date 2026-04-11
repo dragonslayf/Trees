@@ -111,7 +111,7 @@ def mask_centroids(
                 "index": len(out),
                 "cx": cx,
                 "cy": cy,
-                "score": float(sc),
+                "score": float(sc), 
                 "bbox": [float(x1), float(y1), float(x2), float(y2)],
                 "mask_area_px": area,
                 "from_mask": segms is not None and area > 0,
