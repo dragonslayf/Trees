@@ -15,9 +15,6 @@ const domDragOver = ref(false)
 const chmDragOver = ref(false)
 const csvDragOver = ref(false)
 
-const thumbnailFilename = ref<string | null>(null)
-const thumbnailDataDir = ref<string | null>(null)
-const previewKey = ref(0)
 const loading = ref(false)
 const error = ref('')
 const apiStatus = ref<'unknown' | 'ok' | 'error'>('unknown')
@@ -37,39 +34,36 @@ function selectedDomFilename(): string | null {
   return domFile.value?.name ?? null
 }
 
-async function generateThumbnail() {
+/** 若服务器上尚无切片则调用 split_tiff 切分，随后在新窗口打开切片画廊。 */
+async function openTileThumbnails() {
+  const domFilename = selectedDomFilename()
   loading.value = true
   error.value = ''
-  const domFilename = selectedDomFilename()
   try {
-    const params = new URLSearchParams({ thumb_size: '800' })
+    const params = new URLSearchParams()
     if (domFilename) params.set('dom_filename', domFilename)
-    const r = await fetch(`${API_BASE}/api/thumbnail/generate?${params}`, { method: 'POST' })
+    const ensureUrl =
+      params.toString().length > 0
+        ? `${API_BASE}/api/tiles/ensure?${params}`
+        : `${API_BASE}/api/tiles/ensure`
+    const r = await fetch(ensureUrl, { method: 'POST' })
     const data = await r.json().catch(() => ({}))
-    if (!r.ok) throw new Error(data.detail ?? r.statusText)
-    thumbnailFilename.value = data.filename ?? 'DOMZone48_thumb_800x800.tif'
-    thumbnailDataDir.value = data.data_dir ?? null
-    previewKey.value = Date.now()
+    if (!r.ok) throw new Error(typeof data.detail === 'string' ? data.detail : r.statusText)
+    const galleryParams = new URLSearchParams()
+    if (data.dom_filename) galleryParams.set('dom_filename', data.dom_filename)
+    else if (domFilename) galleryParams.set('dom_filename', domFilename)
+    if (data.data_dir) galleryParams.set('data_dir', data.data_dir)
+    const galleryQs = galleryParams.toString()
+    const galleryUrl =
+      galleryQs.length > 0
+        ? `${API_BASE}/api/tiles/gallery?${galleryQs}`
+        : `${API_BASE}/api/tiles/gallery`
+    window.open(galleryUrl, '_blank', 'noopener,noreferrer')
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
   } finally {
     loading.value = false
   }
-}
-
-function thumbnailPreviewUrl(): string {
-  const params = new URLSearchParams()
-  if (thumbnailFilename.value) params.set('filename', thumbnailFilename.value)
-  if (thumbnailDataDir.value) params.set('data_dir', thumbnailDataDir.value)
-  params.set('t', String(previewKey.value))
-  return `${API_BASE}/api/thumbnail/preview.png?${params}`
-}
-
-function thumbnailDownloadUrl(): string {
-  const params = new URLSearchParams()
-  params.set('filename', thumbnailFilename.value ?? 'DOMZone48_thumb_800x800.tif')
-  if (thumbnailDataDir.value) params.set('data_dir', thumbnailDataDir.value)
-  return `${API_BASE}/api/thumbnail/file?${params}`
 }
 
 function openDomPicker() {
@@ -232,27 +226,13 @@ onMounted(() => {
         type="button"
         class="btn btn-primary"
         :disabled="loading || apiStatus !== 'ok'"
-        @click="generateThumbnail"
+        @click="openTileThumbnails"
       >
-        {{ loading ? '生成中…' : '生成 DOM 缩略图 (800×800)' }}
+        {{ loading ? '准备中…' : '查看 DOM 切片缩略图' }}
       </button>
       <p v-if="error" class="error">{{ error }}</p>
     </section>
 
-    <section class="group">
-      <h2>数据预览</h2>
-      <div class="preview-area">
-        <template v-if="thumbnailFilename">
-          <img :src="thumbnailPreviewUrl()" alt="DOM 缩略图" class="preview-img" />
-          <p class="preview-actions">
-            <a :href="thumbnailDownloadUrl()" target="_blank" rel="noopener" class="link">下载 TIFF 缩略图</a>
-          </p>
-        </template>
-        <template v-else>
-          <p class="muted">请先选择 DOM 影像并点击「生成 DOM 缩略图」。</p>
-        </template>
-      </div>
-    </section>
   </div>
 </template>
 
@@ -385,22 +365,8 @@ onMounted(() => {
   min-height: 120px;
 }
 
-.preview-img {
-  max-width: 100%;
-  max-height: 400px;
-  display: block;
-  border-radius: 4px;
-}
-
-.preview-actions {
-  margin-top: 0.75rem;
-}
-
-.link {
-  color: #64b5f6;
-}
-
-.link:hover {
-  text-decoration: underline;
+.code-inline {
+  font-size: 0.85em;
+  color: #9ccc9c;
 }
 </style>
