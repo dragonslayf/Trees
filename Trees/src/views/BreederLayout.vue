@@ -23,7 +23,12 @@ import { RouterLink, RouterView } from 'vue-router'
       </section>
     </aside>
     <main class="main-content">
-      <RouterView />
+      <!-- 仅缓存单木分割：离开路由后组件不销毁，进度与流式请求继续在本实例上更新 -->
+      <RouterView v-slot="{ Component }">
+        <KeepAlive :include="['TreeSegmentationView']">
+          <component :is="Component" />
+        </KeepAlive>
+      </RouterView>
     </main>
   </div>
 </template>

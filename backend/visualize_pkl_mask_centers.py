@@ -26,6 +26,23 @@ if str(_ROOT) not in sys.path:
 from export_box_crops import read_tif_rgb_as_uint8  # noqa: E402
 
 
+def raster_pixel_area_m2(image_path: Path) -> float:
+    """
+    单像元地面面积（m²），来自 GeoTIFF 仿射变换；无法读取时退化为 1.0，
+    此时 ``min_canopy_area_m2`` 等效于最小掩膜像素数。
+    """
+    try:
+        import rasterio  # type: ignore
+
+        with rasterio.open(str(image_path)) as src:
+            t = src.transform
+            pw = abs(float(t[0]))
+            ph = abs(float(t[4]))
+            return float(pw * ph)
+    except Exception:
+        return 1.0
+
+
 def load_image_rgb(path: Path) -> np.ndarray:
     """返回 RGB uint8, 形状 (H,W,3)。"""
     suf = path.suffix.lower()
@@ -85,36 +102,48 @@ def mask_centroids(
     bboxes: np.ndarray,
     segms: np.ndarray | None,
     score_thr: float,
+    *,
+    pixel_area_m2: float,
+    min_canopy_area_m2: float = 0.0,
 ) -> list[dict]:
-    """对每个 score>=thr 的实例计算质心；无掩码时用框中心。"""
+    """对每个 score>=thr 的实例计算质心；无掩码时用框中心。按树冠面积（m²）过滤。"""
+    pa = float(pixel_area_m2) if pixel_area_m2 > 0 else 1.0
+    min_m2 = float(min_canopy_area_m2)
     out: list[dict] = []
     for i in range(bboxes.shape[0]):
         x1, y1, x2, y2, sc = bboxes[i].tolist()
         if sc < score_thr:
             continue
         cx = cy = None
-        area = 0
+        area_px = 0
+        from_mask = False
         if segms is not None and i < segms.shape[0]:
             m = segms[i]
             ys, xs = np.where(m > 0)
-            area = int(xs.size)
-            if area > 0:
+            area_px = int(xs.size)
+            if area_px > 0:
                 cx = float(xs.mean())
                 cy = float(ys.mean())
+                from_mask = True
         if cx is None:
             cx = float((x1 + x2) * 0.5)
             cy = float((y1 + y2) * 0.5)
-            area = max(0, int((x2 - x1) * (y2 - y1)))
+            area_px = max(0, int(abs(x2 - x1) * abs(y2 - y1)))
+
+        area_m2 = float(area_px) * pa
+        if area_m2 < min_m2:
+            continue
 
         out.append(
             {
                 "index": len(out),
                 "cx": cx,
                 "cy": cy,
-                "score": float(sc), 
+                "score": float(sc),
                 "bbox": [float(x1), float(y1), float(x2), float(y2)],
-                "mask_area_px": area,
-                "from_mask": segms is not None and area > 0,
+                "mask_area_px": area_px,
+                "mask_area_m2": round(area_m2, 6),
+                "from_mask": from_mask,
             }
         )
     return out
@@ -156,6 +185,12 @@ def main() -> None:
         help="质心列表 JSON（默认: 与 out 同 stem 的 .json）",
     )
     ap.add_argument("--score-thr", type=float, default=0.3, help="与推理可视化一致的分数阈值")
+    ap.add_argument(
+        "--min-canopy-area-m2",
+        type=float,
+        default=0.0,
+        help="最小树冠面积（m²），由掩膜像素数×像元面积得到；无地理坐标时像元面积按 1 则等效为像素数",
+    )
     ap.add_argument("--radius", type=int, default=6, help="圆点半径（像素）")
     args = ap.parse_args()
 
@@ -170,7 +205,14 @@ def main() -> None:
         result = pickle.load(f)
 
     bboxes, segms = parse_mmdet2_result(result)
-    centers = mask_centroids(bboxes, segms, score_thr=args.score_thr)
+    pixel_area_m2 = raster_pixel_area_m2(img_path)
+    centers = mask_centroids(
+        bboxes,
+        segms,
+        score_thr=args.score_thr,
+        pixel_area_m2=pixel_area_m2,
+        min_canopy_area_m2=args.min_canopy_area_m2,
+    )
 
     img = load_image_rgb(img_path)
     vis = draw_centers(img, centers, radius=args.radius)
@@ -189,8 +231,18 @@ def main() -> None:
         json_path = out.with_suffix(".json")
     else:
         json_path = json_path.expanduser().resolve()
+    payload = {
+        "meta": {
+            "pixel_area_m2": pixel_area_m2,
+            "score_thr": float(args.score_thr),
+            "min_canopy_area_m2": float(args.min_canopy_area_m2),
+            "image": str(img_path),
+            "image_shape": list(img.shape[:2]),
+        },
+        "centers": centers,
+    }
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(centers, f, indent=2, ensure_ascii=False)
+        json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
 if __name__ == "__main__":

@@ -27,12 +27,13 @@ from pydantic import BaseModel
 # 与缩略图脚本同目录，便于直接 import
 from split_tiff_tiles import split_tiff
 
-# 数据目录 = 本文件所在目录（20260114）
-DATA_DIR = Path(__file__).resolve().parent
+# 数据目录 = 本文件上级目录（项目根）下的 data 文件夹
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 TREES_ROOT = DATA_DIR.parent
-MODELS_DIR = TREES_ROOT / "Models"
+MODELS_DIR = TREES_ROOT / "models"
+BACKEND_DIR = TREES_ROOT / "backend"
 RUN_MODEL_SCRIPT = MODELS_DIR / "run_model_from_config.py"
-VISUALIZE_SCRIPT = MODELS_DIR / "visualize_pkl_mask_centers.py"
+VISUALIZE_SCRIPT = BACKEND_DIR / "visualize_pkl_mask_centers.py"
 DEFAULT_SEG_CONFIG = MODELS_DIR / "20230430_224903_config3.py"
 
 
@@ -99,7 +100,7 @@ def _unlink_if_exists(path: Path) -> None:
 
 
 def _remove_prior_vis_outputs(marked_dir: Path, tile_stem: str, pkl_stem: str) -> None:
-    """置信度变化重绘前删除 marked_result 下该切片旧的可视化产物（PNG/JSON 及脚本默认命名遗留）。"""
+    """删除旧版固定命名 ``{tile}_vis.png`` 及 centers 遗留（与按参数后缀命名共存清理）。"""
     vis_path = marked_dir / f"{tile_stem}_vis.png"
     legacy_centers = marked_dir / f"{pkl_stem}_centers.png"
     for p in (
@@ -109,6 +110,28 @@ def _remove_prior_vis_outputs(marked_dir: Path, tile_stem: str, pkl_stem: str) -
         legacy_centers.with_suffix(".json"),
     ):
         _unlink_if_exists(p)
+
+
+def _vis_param_suffix(score_thr: float, min_canopy_area_m2: float) -> str:
+    """与 ``visualize_pkl_mask_centers.py`` 输出文件名后缀一致：置信度(百分整数)+最小面积(m²)。"""
+    pct = int(round(float(score_thr) * 100))
+    s = f"{float(min_canopy_area_m2):.4f}".rstrip("0").rstrip(".") or "0"
+    s = s.replace(".", "p")
+    return f"c{pct}m{s}"
+
+
+def _marked_vis_png_name(tile_stem: str, score_thr: float, min_canopy_area_m2: float) -> str:
+    return f"{tile_stem}_vis_{_vis_param_suffix(score_thr, min_canopy_area_m2)}.png"
+
+
+def _marked_vis_outputs_ready(marked_dir: Path, png_name: str) -> bool:
+    p = marked_dir / png_name
+    return p.is_file() and p.with_suffix(".json").is_file()
+
+
+def _unlink_marked_vis_pair(marked_dir: Path, png_name: str) -> None:
+    _unlink_if_exists(marked_dir / png_name)
+    _unlink_if_exists((marked_dir / png_name).with_suffix(".json"))
 
 
 app = FastAPI(
@@ -253,7 +276,7 @@ def ensure_dom_tiles(
 def tiles_gallery(dom_filename: str | None = None, data_dir: str | None = None):
     """简单 HTML 画廊：展示 ``tile_result`` 内当前 DOM 对应全部切片的 PNG 预览。"""
     use_data_dir = _resolve_data_dir(data_dir)
-    use_dom = (dom_filename or "").strip() or "DOMZone48.tif"
+    use_dom = (dom_filename or "").strip()
     stem = Path(use_dom).stem
     pattern = f"{stem}_tile_r*_c*.tif"
     files = sorted(_tile_result_dir(use_data_dir).glob(pattern))
@@ -307,13 +330,14 @@ class SegmentRunIn(BaseModel):
     data_dir: str | None = None
     overwrite: bool = False
     score_thr: float = 0.3
+    min_canopy_area_m2: float = 0.0
 
 
 @app.get("/api/segment/has-existing")
 def segment_has_existing(dom_filename: str | None = None, data_dir: str | None = None):
     """检查当前 DOM 对应切片是否已有任意 result.pkl（用于前端覆盖确认）。"""
     use_data_dir = _resolve_data_dir(data_dir)
-    use_dom = (dom_filename or "").strip() or "DOMZone48.tif"
+    use_dom = (dom_filename or "").strip()
     stem = Path(use_dom).stem
     seg_dir = _segmentation_result_dir(use_data_dir)
     marked_dir = _marked_result_dir(use_data_dir)
@@ -345,6 +369,9 @@ def segment_run(body: SegmentRunIn):
     """
     对 ``tile_result`` 下该 DOM 的全部 800×800 切片依次调用 run_model_from_config.py；
     pkl 写入 ``segmentation_result``，可视化写入 ``tile_result/marked_result``。
+
+    响应为 NDJSON 流：每行一条 JSON，含 type=progress|done|error，progress 的 n/total
+    为已完成的块数（每块含推理 + 可视化），与 ``/api/segment/regenerate-vis`` 一致便于前端进度条。
     """
     if not RUN_MODEL_SCRIPT.is_file():
         raise HTTPException(status_code=500, detail=f"未找到脚本: {RUN_MODEL_SCRIPT}")
@@ -377,63 +404,109 @@ def segment_run(body: SegmentRunIn):
 
     ckpt = _find_checkpoint()
     cfg_rel = cfg_path.name
-    processed = 0
-    for t in tiles:
-        pkl_path = pkl_dir / f"{t.stem}_result.pkl"
-        vis_path = marked_dir / f"{t.stem}_vis.png"
-        cmd = [
-            sys.executable,
-            str(RUN_MODEL_SCRIPT.resolve()),
-            "--config",
-            cfg_rel,
-            "--image",
-            str(t.resolve()),
-            "--out-dir",
-            str(pkl_dir),
-            "--save-result",
-            "--score-thr",
-            str(body.score_thr),
-        ]
-        if ckpt:
-            cmd.extend(["--checkpoint", ckpt])
-        _run_subprocess_or_500(cmd, cwd=MODELS_DIR)
+    total = len(tiles)
 
-        if not pkl_path.is_file():
-            raise HTTPException(
-                status_code=500,
-                detail=f"推理后未生成 pkl: {pkl_path.name}",
-            )
+    def ndjson_stream():
+        try:
+            yield json.dumps(
+                {"type": "progress", "n": 0, "total": total},
+                ensure_ascii=False,
+            ) + "\n"
+            processed = 0
+            for t in tiles:
+                pkl_path = pkl_dir / f"{t.stem}_result.pkl"
+                vis_png = _marked_vis_png_name(
+                    t.stem, body.score_thr, body.min_canopy_area_m2
+                )
+                vis_path = marked_dir / vis_png
+                cmd = [
+                    sys.executable,
+                    str(RUN_MODEL_SCRIPT.resolve()),
+                    "--config",
+                    cfg_rel,
+                    "--image",
+                    str(t.resolve()),
+                    "--out-dir",
+                    str(pkl_dir),
+                    "--save-result",
+                    "--score-thr",
+                    str(body.score_thr),
+                ]
+                if ckpt:
+                    cmd.extend(["--checkpoint", ckpt])
+                _run_subprocess_or_500(cmd, cwd=MODELS_DIR)
 
-        vcmd = [
-            sys.executable,
-            str(VISUALIZE_SCRIPT.resolve()),
-            "--pkl",
-            str(pkl_path.resolve()),
-            "--image",
-            str(t.resolve()),
-            "--out",
-            str(vis_path.resolve()),
-            "--score-thr",
-            str(body.score_thr),
-        ]
-        _run_subprocess_or_500(vcmd, cwd=MODELS_DIR)
-        processed += 1
+                if not pkl_path.is_file():
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"推理后未生成 pkl: {pkl_path.name}",
+                    )
 
-    return {
-        "ok": True,
-        "processed": processed,
-        "data_dir": str(use_data_dir),
-        "tile_result_dir": str(_tile_result_dir(use_data_dir)),
-        "segmentation_result_dir": str(pkl_dir),
-        "marked_result_dir": str(marked_dir),
-        "dom_filename": use_dom,
-    }
+                if _marked_vis_outputs_ready(marked_dir, vis_png):
+                    processed += 1
+                else:
+                    _unlink_marked_vis_pair(marked_dir, vis_png)
+                    vcmd = [
+                        sys.executable,
+                        str(VISUALIZE_SCRIPT.resolve()),
+                        "--pkl",
+                        str(pkl_path.resolve()),
+                        "--image",
+                        str(t.resolve()),
+                        "--out",
+                        str(vis_path.resolve()),
+                        "--score-thr",
+                        str(body.score_thr),
+                        "--min-canopy-area-m2",
+                        str(body.min_canopy_area_m2),
+                    ]
+                    _run_subprocess_or_500(vcmd, cwd=MODELS_DIR)
+                    processed += 1
+                yield json.dumps(
+                    {"type": "progress", "n": processed, "total": total},
+                    ensure_ascii=False,
+                ) + "\n"
+            yield json.dumps(
+                {
+                    "type": "done",
+                    "ok": True,
+                    "processed": processed,
+                    "data_dir": str(use_data_dir),
+                    "tile_result_dir": str(_tile_result_dir(use_data_dir)),
+                    "segmentation_result_dir": str(pkl_dir),
+                    "marked_result_dir": str(marked_dir),
+                    "dom_filename": use_dom,
+                    "score_thr": body.score_thr,
+                    "min_canopy_area_m2": body.min_canopy_area_m2,
+                },
+                ensure_ascii=False,
+            ) + "\n"
+        except HTTPException as e:
+            yield json.dumps(
+                {"type": "error", "detail": str(e.detail)},
+                ensure_ascii=False,
+            ) + "\n"
+        except Exception as e:
+            yield json.dumps(
+                {"type": "error", "detail": str(e)},
+                ensure_ascii=False,
+            ) + "\n"
+
+    return StreamingResponse(
+        ndjson_stream(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 class SegmentRegenerateVisIn(BaseModel):
     dom_filename: str | None = None
     data_dir: str | None = None
     score_thr: float = 0.3
+    min_canopy_area_m2: float = 0.0
 
 
 @app.post("/api/segment/regenerate-vis")
@@ -472,22 +545,30 @@ def segment_regenerate_vis(body: SegmentRegenerateVisIn):
             regenerated = 0
             for t in tiles_with_pkl:
                 pkl_path = pkl_dir / f"{t.stem}_result.pkl"
-                _remove_prior_vis_outputs(marked_dir, t.stem, pkl_path.stem)
-                vis_path = marked_dir / f"{t.stem}_vis.png"
-                vcmd = [
-                    sys.executable,
-                    str(VISUALIZE_SCRIPT.resolve()),
-                    "--pkl",
-                    str(pkl_path.resolve()),
-                    "--image",
-                    str(t.resolve()),
-                    "--out",
-                    str(vis_path.resolve()),
-                    "--score-thr",
-                    str(body.score_thr),
-                ]
-                _run_subprocess_or_500(vcmd, cwd=MODELS_DIR)
-                regenerated += 1
+                vis_png = _marked_vis_png_name(
+                    t.stem, body.score_thr, body.min_canopy_area_m2
+                )
+                vis_path = marked_dir / vis_png
+                if _marked_vis_outputs_ready(marked_dir, vis_png):
+                    regenerated += 1
+                else:
+                    _unlink_marked_vis_pair(marked_dir, vis_png)
+                    vcmd = [
+                        sys.executable,
+                        str(VISUALIZE_SCRIPT.resolve()),
+                        "--pkl",
+                        str(pkl_path.resolve()),
+                        "--image",
+                        str(t.resolve()),
+                        "--out",
+                        str(vis_path.resolve()),
+                        "--score-thr",
+                        str(body.score_thr),
+                        "--min-canopy-area-m2",
+                        str(body.min_canopy_area_m2),
+                    ]
+                    _run_subprocess_or_500(vcmd, cwd=MODELS_DIR)
+                    regenerated += 1
                 yield json.dumps(
                     {"type": "progress", "n": regenerated, "total": total},
                     ensure_ascii=False,
@@ -503,6 +584,7 @@ def segment_regenerate_vis(body: SegmentRegenerateVisIn):
                     "marked_result_dir": str(marked_dir),
                     "dom_filename": use_dom,
                     "score_thr": body.score_thr,
+                    "min_canopy_area_m2": body.min_canopy_area_m2,
                 },
                 ensure_ascii=False,
             ) + "\n"
@@ -557,6 +639,8 @@ def segment_overlay_gallery(
     dom_filename: str | None = None,
     data_dir: str | None = None,
     t: str | None = None,
+    score_thr: float | None = None,
+    min_canopy_area_m2: float | None = None,
 ):
     """分割结果画廊：``tile_result`` 切片与 ``tile_result/marked_result`` 可视化。"""
     use_data_dir = _resolve_data_dir(data_dir)
@@ -565,6 +649,8 @@ def segment_overlay_gallery(
     marked_dir = _marked_result_dir(use_data_dir)
     cache_token = (t or "").strip()
     tiles = _dom_tile_paths(use_data_dir, stem)
+    thr = float(score_thr) if score_thr is not None else 0.3
+    min_m2 = float(min_canopy_area_m2) if min_canopy_area_m2 is not None else 0.0
     if not tiles:
         return HTMLResponse(
             "<!DOCTYPE html><html><head><meta charset='utf-8'><title>分割预览</title></head>"
@@ -573,7 +659,14 @@ def segment_overlay_gallery(
         )
     cards = []
     for tile_path in tiles:
-        vis_name = f"{tile_path.stem}_vis.png"
+        vis_suffixed = _marked_vis_png_name(tile_path.stem, thr, min_m2)
+        legacy_name = f"{tile_path.stem}_vis.png"
+        if (marked_dir / vis_suffixed).is_file():
+            vis_name = vis_suffixed
+        elif (marked_dir / legacy_name).is_file():
+            vis_name = legacy_name
+        else:
+            vis_name = vis_suffixed
         safe_tile = tile_path.name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         if (marked_dir / vis_name).is_file():
             vis_params: dict[str, str] = {
