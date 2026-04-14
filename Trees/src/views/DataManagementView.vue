@@ -41,6 +41,7 @@ async function openTileThumbnails() {
   error.value = ''
   try {
     const params = new URLSearchParams()
+    params.set('data_dir', "Trees/data")
     if (domFilename) params.set('dom_filename', domFilename)
     const ensureUrl =
       params.toString().length > 0

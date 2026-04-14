@@ -183,7 +183,6 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
 
     cv2.imwrite(str(out), cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
-    print(f"已保存可视化: {out}（质心数量: {len(centers)}）")
 
     json_path = args.json_out
     if json_path is None:
@@ -192,7 +191,6 @@ def main() -> None:
         json_path = json_path.expanduser().resolve()
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(centers, f, indent=2, ensure_ascii=False)
-    print(f"已保存质心 JSON: {json_path}")
 
 
 if __name__ == "__main__":

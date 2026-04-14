@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""将大图按固定 tile 尺寸切分为子图（支持 overlap），保存到同目录。"""
+"""将大图按固定 tile 尺寸切分为子图（支持 overlap）。
+
+默认保存到与输入同目录；若传入 ``out_dir`` 则保存到该目录（如 ``tile_result``）。
+"""
 from __future__ import annotations
 
 import argparse
@@ -15,6 +18,7 @@ def split_tiff(
     overlap: int = 200,   #  新增
     prefix: str | None = None,
     fmt: str = "TIFF",
+    out_dir: Path | None = None,
 ) -> None:
     path = path.resolve()
     if not path.is_file():
@@ -26,7 +30,8 @@ def split_tiff(
     stride = tile - overlap  #  核心
 
     stem = prefix if prefix else path.stem
-    out_dir = path.parent
+    out_dir = (path.parent if out_dir is None else Path(out_dir).resolve())
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     img = Image.open(path)
     W, H = img.size
@@ -74,9 +79,20 @@ def main() -> None:
     )
     p.add_argument("--tile", type=int, default=800, help="子图边长（像素）")
     p.add_argument("--overlap", type=int, default=200, help="重叠像素")  # ✅ 新增参数
+    p.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help="输出目录（默认与输入影像同目录；API 使用 tile_result）",
+    )
     args = p.parse_args()
 
-    split_tiff(args.image, tile=args.tile, overlap=args.overlap)
+    split_tiff(
+        args.image,
+        tile=args.tile,
+        overlap=args.overlap,
+        out_dir=args.out_dir,
+    )
 
 
 if __name__ == "__main__":
