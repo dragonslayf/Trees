@@ -140,12 +140,14 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# Vue 开发服务器默认端口 5173；按需增删
+# Vue 开发服务器常见端口 5173/5174（多实例时 Vite 会顺延）；按需增删
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -737,4 +739,4 @@ def list_data_files(data_dir: str | None = None):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("fastapi_example:app", host="0.0.0.0", port=7000)
+    uvicorn.run("fastapi_example:app", host="0.0.0.0", port=8000)

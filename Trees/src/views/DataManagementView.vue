@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000'
+const API_BASE = 'http://127.0.0.1:7999'
 
 const domFile = ref<File | null>(null)
 const chmFile = ref<File | null>(null)
@@ -21,6 +21,7 @@ const apiStatus = ref<'unknown' | 'ok' | 'error'>('unknown')
 
 async function checkHealth() {
   try {
+    console.log('checkHealth', API_BASE)
     const r = await fetch(`${API_BASE}/health`)
     apiStatus.value = r.ok ? 'ok' : 'error'
     return r.ok

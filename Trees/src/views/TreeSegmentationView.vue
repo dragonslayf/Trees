@@ -4,7 +4,7 @@ import { ref, computed, onMounted, watch } from 'vue'
 /** 供布局中 KeepAlive include 匹配，切换路由时保留本页实例与进行中的分割/可视化任务 */
 defineOptions({ name: 'TreeSegmentationView' })
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000'
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:7000'
 
 /** 仅使用 Mask R-CNN */
 const model = ref('Mask R-CNN')
