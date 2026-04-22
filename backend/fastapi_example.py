@@ -14,18 +14,30 @@ FastAPI 使用示例：与 Vue 前端联调、触发 DOM 缩略图生成等。
 from html import escape as html_escape
 from io import BytesIO
 import json
+import math
+import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 from urllib.parse import urlencode
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
 from pydantic import BaseModel
 
 # 与缩略图脚本同目录，便于直接 import
 from split_tiff_tiles import split_tiff
+from visualize_pkl_mask_centers import merge_tile_json_to_whole_json
+
+import user_session
 
 # 数据目录 = 本文件上级目录（项目根）下的 data 文件夹
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -36,25 +48,68 @@ RUN_MODEL_SCRIPT = MODELS_DIR / "run_model_from_config.py"
 VISUALIZE_SCRIPT = BACKEND_DIR / "visualize_pkl_mask_centers.py"
 DEFAULT_SEG_CONFIG = MODELS_DIR / "20230430_224903_config3.py"
 
+user_session.configure(DATA_DIR)
 
-def _tile_result_dir(data_dir: Path) -> Path:
-    """800×800 切片目录：``{data_dir}/tile_result``"""
-    return (data_dir / "tile_result").resolve()
+UPLOAD_MANIFEST_NAME = ".upload_manifest.json"
 
 
 def _segmentation_result_dir(data_dir: Path) -> Path:
-    """模型单木分割 pkl 等：``{data_dir}/segmentation_result``"""
+    """切片 TIFF、pkl、等与分割相关的输出根目录：``{data_dir}/segmentation_result``"""
     return (data_dir / "segmentation_result").resolve()
 
 
 def _marked_result_dir(data_dir: Path) -> Path:
-    """单木位置可视化：``{data_dir}/tile_result/marked_result``"""
-    return (_tile_result_dir(data_dir) / "marked_result").resolve()
+    """单木位置可视化：``{data_dir}/segmentation_result/marked_result``"""
+    return (_segmentation_result_dir(data_dir) / "marked_result").resolve()
 
 
 def _dom_tile_paths(data_dir: Path, stem: str) -> list[Path]:
-    """某 DOM stem 对应的全部切片路径（位于 tile_result）。"""
-    return sorted(_tile_result_dir(data_dir).glob(f"{stem}_tile_r*_c*.tif"))
+    """某 DOM stem 对应的全部切片路径（与 pkl 同在 segmentation_result）。"""
+    return sorted(_segmentation_result_dir(data_dir).glob(f"{stem}_tile_r*_c*.tif"))
+
+
+def _read_upload_manifest(user_dir: Path) -> dict[str, str]:
+    p = user_dir / UPLOAD_MANIFEST_NAME
+    if not p.is_file():
+        return {}
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    out: dict[str, str] = {}
+    for k in ("dom", "chm", "csv"):
+        v = raw.get(k)
+        if isinstance(v, str) and v.strip():
+            out[k] = v.strip()
+    return out
+
+
+def _write_upload_manifest(user_dir: Path, manifest: dict[str, str]) -> None:
+    (user_dir / UPLOAD_MANIFEST_NAME).write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _safe_unlink_user_file(path: Path) -> None:
+    try:
+        if path.is_file():
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _remove_legacy_tile_result_dir(data_dir: Path) -> None:
+    """历史 ``tile_result`` 与 segmentation_result 并存时仅保留后者；上传替换时可删遗留目录。"""
+    tr = (data_dir / "tile_result").resolve()
+    if tr.is_dir():
+        shutil.rmtree(tr, ignore_errors=True)
+
+
+def _wipe_segmentation_result(data_dir: Path) -> None:
+    seg = _segmentation_result_dir(data_dir)
+    if seg.is_dir():
+        shutil.rmtree(seg, ignore_errors=True)
 
 
 def _find_checkpoint() -> str | None:
@@ -148,6 +203,8 @@ app.add_middleware(
         "http://127.0.0.1:5173",
         "http://localhost:5174",
         "http://127.0.0.1:5174",
+        "http://localhost:5175",
+        "http://127.0.0.1:5175",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -162,13 +219,192 @@ def root():
 
 @app.get("/health")
 def health():
+    """顺带触发会话过期与孤儿目录清理，便于长时间无业务请求时仍能回收磁盘。"""
+    user_session.maintenance_cleanup()
     return {"status": "ok"}
 
 
+@app.post("/api/session/init")
+def session_init(request: Request):
+    """
+    建立或恢复会话：设置 HttpOnly Cookie（1 小时），数据目录为 ``users/<session_id>``。
+    活跃会话满 10 个时返回 429。
+    """
+    user_session.maintenance_cleanup()
+    sid = request.cookies.get(user_session.COOKIE_NAME)
+
+    if sid and user_session.is_valid_session(sid):
+        user_session.ensure_session_cookie(sid)
+        exp = user_session.refresh_session_expiry(sid)
+        if exp is None:
+            exp = user_session.get_session_expiry(sid)
+        return JSONResponse(
+            {
+                "ok": True,
+                "data_dir": user_session.session_data_dir_relative(sid),
+                "expires_at": exp,
+                "slots_used": user_session.active_count(),
+                "slots_max": user_session.MAX_ACTIVE_SESSIONS,
+                "is_new": False,
+            }
+        )
+
+    try:
+        sid, exp = user_session.register_session()
+    except user_session.SessionLimitError as e:
+        raise HTTPException(status_code=429, detail=str(e)) from e
+
+    payload = {
+        "ok": True,
+        "data_dir": user_session.session_data_dir_relative(sid),
+        "expires_at": exp,
+        "slots_used": user_session.active_count(),
+        "slots_max": user_session.MAX_ACTIVE_SESSIONS,
+        "is_new": True,
+    }
+    r = JSONResponse(payload)
+    r.set_cookie(
+        key=user_session.COOKIE_NAME,
+        value=sid,
+        max_age=user_session.SESSION_TTL_SEC,
+        httponly=True,
+        samesite="lax",
+        path="/",
+    )
+    return r
+
+
+def _safe_upload_name(name: str) -> str:
+    base = Path(name).name
+    if not base or ".." in base or "/" in base or "\\" in base:
+        raise HTTPException(status_code=400, detail="非法文件名")
+    return base
+
+
+@app.post("/api/user/upload")
+async def user_upload(
+    request: Request,
+    dom: UploadFile | None = File(None),
+    chm: UploadFile | None = File(None),
+    csv: UploadFile | None = File(None),
+):
+    """将 DOM/CHM/CSV 保存到当前 Cookie 对应目录 ``users/<id>/``。
+
+    再次上传同类型文件时：删除该类型上一份原始文件；上传新 DOM 时还会清空
+    ``segmentation_result`` 及遗留的 ``tile_result``（切分与分割派生结果）。
+    """
+    user_session.maintenance_cleanup()
+    sid = request.cookies.get(user_session.COOKIE_NAME)
+    if not user_session.is_valid_session(sid):
+        raise HTTPException(
+            status_code=401,
+            detail="会话无效或已过期，请先刷新页面并重新建立会话",
+        )
+    user_dir = (DATA_DIR / "users" / sid).resolve()
+    users_root = (DATA_DIR / "users").resolve()
+    try:
+        user_dir.relative_to(users_root)
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail="用户目录异常") from e
+
+    planned: list[tuple[UploadFile, str, str]] = []
+    for uf, label, key in (
+        (dom, "dom", "dom"),
+        (chm, "chm", "chm"),
+        (csv, "csv", "csv"),
+    ):
+        if uf is not None and uf.filename:
+            planned.append((uf, label, key))
+
+    if not planned:
+        raise HTTPException(status_code=400, detail="请至少选择一个文件上传")
+
+    manifest_before = _read_upload_manifest(user_dir)
+
+    has_dom = any(k == "dom" for _, _, k in planned)
+    if has_dom:
+        dom_uf = next(uf for uf, _, k in planned if k == "dom")
+        new_dom_name = _safe_upload_name(dom_uf.filename)
+        prev_dom = manifest_before.get("dom")
+        if prev_dom and prev_dom != new_dom_name:
+            _safe_unlink_user_file(user_dir / prev_dom)
+        _wipe_segmentation_result(user_dir)
+        _remove_legacy_tile_result_dir(user_dir)
+
+    for uf, label, key in planned:
+        if key != "chm" and key != "csv":
+            continue
+        fname = _safe_upload_name(uf.filename)
+        prev = manifest_before.get(key)
+        if prev and prev != fname:
+            _safe_unlink_user_file(user_dir / prev)
+
+    saved: list[str] = []
+    manifest_after = dict(manifest_before)
+    for uf, label, key in planned:
+        fname = _safe_upload_name(uf.filename)
+        dest = user_dir / fname
+        body = await uf.read()
+        if len(body) > 200 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"{label} 文件过大（单文件上限 200MB）")
+        dest.write_bytes(body)
+        saved.append(fname)
+        manifest_after[key] = fname
+
+    _write_upload_manifest(user_dir, manifest_after)
+
+    saved_keys = [key for _, _, key in planned]
+    return {
+        "ok": True,
+        "saved": saved,
+        "saved_keys": saved_keys,
+        "data_dir": user_session.session_data_dir_relative(sid),
+    }
+
+
+@app.get("/api/user/files")
+def list_user_files(request: Request):
+    """列出当前 Cookie 会话目录 ``users/<id>/`` 下的文件名（不含子目录），供前端自动识别 DOM 等。"""
+    user_session.maintenance_cleanup()
+    sid = request.cookies.get(user_session.COOKIE_NAME)
+    if not user_session.is_valid_session(sid):
+        raise HTTPException(
+            status_code=401,
+            detail="会话无效或已过期，请先在数据管理页建立会话",
+        )
+    user_dir = (DATA_DIR / "users" / sid).resolve()
+    users_root = (DATA_DIR / "users").resolve()
+    try:
+        user_dir.relative_to(users_root)
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail="用户目录异常") from e
+    if not user_dir.is_dir():
+        return {
+            "data_dir": user_session.session_data_dir_relative(sid),
+            "files": [],
+        }
+    files = [p.name for p in user_dir.iterdir() if p.is_file() and not p.name.startswith(".")]
+    return {
+        "data_dir": user_session.session_data_dir_relative(sid),
+        "files": sorted(files),
+    }
+
+
 def _resolve_data_dir(data_dir: str | None) -> Path:
-    """请求使用的数据目录：未传则用默认 DATA_DIR，否则解析为绝对路径（可传相对路径，相对当前工作目录）。"""
+    """请求使用的数据目录：默认 DATA_DIR；``users/<32位hex>`` 解析为 ``DATA_DIR/users/...``。"""
     if not data_dir or not data_dir.strip():
         return DATA_DIR
+    s = data_dir.strip().replace("\\", "/")
+    if s.startswith("users/"):
+        rel = s[6:].strip("/")
+        if re.match(r"^[a-f0-9]{32}$", rel):
+            p = (DATA_DIR / "users" / rel).resolve()
+            users_root = (DATA_DIR / "users").resolve()
+            try:
+                p.relative_to(users_root)
+            except ValueError:
+                return DATA_DIR
+            return p if p.is_dir() else DATA_DIR
     p = Path(data_dir).resolve()
     return p if p.is_dir() else DATA_DIR
 
@@ -217,12 +453,12 @@ def tile_preview_png(
     data_dir: str | None = None,
     t: str | None = None,
 ):
-    """``tile_result`` 下的切片 TIFF 转 PNG，供画廊页 img 引用。"""
+    """``segmentation_result`` 下的切片 TIFF 转 PNG，供画廊页 img 引用。"""
     use_dir = _resolve_data_dir(data_dir)
     name = (filename or "").strip()
     if not name or Path(name).name != name:
         raise HTTPException(status_code=400, detail="非法文件名")
-    base = _tile_result_dir(use_dir).resolve()
+    base = _segmentation_result_dir(use_dir).resolve()
     path = (base / name).resolve()
     if path.parent != base:
         raise HTTPException(status_code=400, detail="路径越界")
@@ -242,18 +478,30 @@ def ensure_dom_tiles(
 ):
     """
     若指定 DOM 对应的切片尚不存在，则调用 split_tiff_tiles.split_tiff 切分；
-    切片写入 ``data_dir/tile_result``。已存在则跳过。
+    切片写入 ``data_dir/segmentation_result``（与 pkl 同目录）。已存在则跳过。
     """
     use_data_dir = _resolve_data_dir(data_dir)
-    use_dom = (dom_filename or "").strip() or "DOMZone48.tif"
+    use_dom = (dom_filename or "").strip()
     dom_path = use_data_dir / use_dom
     if not dom_path.is_file():
         raise HTTPException(status_code=404, detail=f"DOM 文件不存在: {use_dom}")
     stem = dom_path.stem
-    tile_root = _tile_result_dir(use_data_dir)
+    tile_root = _segmentation_result_dir(use_data_dir)
     pattern = f"{stem}_tile_r*_c*.tif"
+    tile_root.mkdir(parents=True, exist_ok=True)
     existing = sorted(tile_root.glob(pattern))
     split_run = False
+    if not existing:
+        legacy_root = (use_data_dir / "tile_result").resolve()
+        if legacy_root.is_dir():
+            for p in sorted(legacy_root.glob(pattern)):
+                dest = tile_root / p.name
+                if not dest.is_file():
+                    try:
+                        shutil.move(str(p), str(dest))
+                    except OSError:
+                        pass
+            existing = sorted(tile_root.glob(pattern))
     if not existing:
         try:
             split_tiff(dom_path, tile=tile, overlap=overlap, out_dir=tile_root)
@@ -266,7 +514,7 @@ def ensure_dom_tiles(
     return {
         "ok": True,
         "data_dir": str(use_data_dir),
-        "tile_result_dir": str(tile_root),
+        "segmentation_result_dir": str(tile_root),
         "stem": stem,
         "dom_filename": use_dom,
         "tiles": [f.name for f in existing],
@@ -276,12 +524,12 @@ def ensure_dom_tiles(
 
 @app.get("/api/tiles/gallery", response_class=HTMLResponse)
 def tiles_gallery(dom_filename: str | None = None, data_dir: str | None = None):
-    """简单 HTML 画廊：展示 ``tile_result`` 内当前 DOM 对应全部切片的 PNG 预览。"""
+    """简单 HTML 画廊：展示 ``segmentation_result`` 内当前 DOM 对应全部切片的 PNG 预览。"""
     use_data_dir = _resolve_data_dir(data_dir)
     use_dom = (dom_filename or "").strip()
     stem = Path(use_dom).stem
     pattern = f"{stem}_tile_r*_c*.tif"
-    files = sorted(_tile_result_dir(use_data_dir).glob(pattern))
+    files = sorted(_segmentation_result_dir(use_data_dir).glob(pattern))
     if not files:
         return HTMLResponse(
             "<!DOCTYPE html><html><head><meta charset='utf-8'><title>切片预览</title></head>"
@@ -350,7 +598,6 @@ def segment_has_existing(dom_filename: str | None = None, data_dir: str | None =
             "has_any_pkl": False,
             "tile_count": 0,
             "data_dir": str(use_data_dir),
-            "tile_result_dir": str(_tile_result_dir(use_data_dir)),
             "segmentation_result_dir": str(seg_dir),
             "marked_result_dir": str(marked_dir),
         }
@@ -360,7 +607,6 @@ def segment_has_existing(dom_filename: str | None = None, data_dir: str | None =
         "has_any_pkl": has_any,
         "tile_count": len(tiles),
         "data_dir": str(use_data_dir),
-        "tile_result_dir": str(_tile_result_dir(use_data_dir)),
         "segmentation_result_dir": str(seg_dir),
         "marked_result_dir": str(marked_dir),
     }
@@ -369,8 +615,8 @@ def segment_has_existing(dom_filename: str | None = None, data_dir: str | None =
 @app.post("/api/segment/run")
 def segment_run(body: SegmentRunIn):
     """
-    对 ``tile_result`` 下该 DOM 的全部 800×800 切片依次调用 run_model_from_config.py；
-    pkl 写入 ``segmentation_result``，可视化写入 ``tile_result/marked_result``。
+    对 ``segmentation_result`` 下该 DOM 的全部 800×800 切片依次调用 run_model_from_config.py；
+    pkl 与切片同目录，可视化写入 ``segmentation_result/marked_result``。
 
     响应为 NDJSON 流：每行一条 JSON，含 type=progress|done|error，progress 的 n/total
     为已完成的块数（每块含推理 + 可视化），与 ``/api/segment/regenerate-vis`` 一致便于前端进度条。
@@ -381,7 +627,7 @@ def segment_run(body: SegmentRunIn):
         raise HTTPException(status_code=500, detail=f"未找到脚本: {VISUALIZE_SCRIPT}")
 
     use_data_dir = _resolve_data_dir(body.data_dir)
-    use_dom = (body.dom_filename or "").strip() or "DOMZone48.tif"
+    use_dom = (body.dom_filename or "").strip()
     stem = Path(use_dom).stem
     tiles = _dom_tile_paths(use_data_dir, stem)
     if not tiles:
@@ -468,21 +714,41 @@ def segment_run(body: SegmentRunIn):
                     {"type": "progress", "n": processed, "total": total},
                     ensure_ascii=False,
                 ) + "\n"
-            yield json.dumps(
-                {
-                    "type": "done",
-                    "ok": True,
-                    "processed": processed,
-                    "data_dir": str(use_data_dir),
-                    "tile_result_dir": str(_tile_result_dir(use_data_dir)),
-                    "segmentation_result_dir": str(pkl_dir),
-                    "marked_result_dir": str(marked_dir),
-                    "dom_filename": use_dom,
-                    "score_thr": body.score_thr,
-                    "min_canopy_area_m2": body.min_canopy_area_m2,
-                },
-                ensure_ascii=False,
-            ) + "\n"
+            whole_json: str | None = None
+            whole_mark_png: str | None = None
+            whole_json_error: str | None = None
+            try:
+                p_json, p_mark = merge_tile_json_to_whole_json(
+                    dom_image=use_data_dir / use_dom,
+                    seg_result_dir=pkl_dir,
+                    marked_dir=marked_dir,
+                    score_thr=body.score_thr,
+                    min_canopy_area_m2=body.min_canopy_area_m2,
+                    tile=800,
+                    overlap=200,
+                )
+                whole_json = str(p_json)
+                whole_mark_png = str(p_mark)
+            except Exception as e:
+                whole_json_error = str(e)
+            done_payload: dict = {
+                "type": "done",
+                "ok": True,
+                "processed": processed,
+                "data_dir": str(use_data_dir),
+                "segmentation_result_dir": str(pkl_dir),
+                "marked_result_dir": str(marked_dir),
+                "dom_filename": use_dom,
+                "score_thr": body.score_thr,
+                "min_canopy_area_m2": body.min_canopy_area_m2,
+            }
+            if whole_json:
+                done_payload["whole_centers_json"] = whole_json
+            if whole_mark_png:
+                done_payload["whole_mark_png"] = whole_mark_png
+            if whole_json_error:
+                done_payload["whole_centers_json_error"] = whole_json_error
+            yield json.dumps(done_payload, ensure_ascii=False) + "\n"
         except HTTPException as e:
             yield json.dumps(
                 {"type": "error", "detail": str(e.detail)},
@@ -523,7 +789,7 @@ def segment_regenerate_vis(body: SegmentRegenerateVisIn):
         raise HTTPException(status_code=500, detail=f"未找到脚本: {VISUALIZE_SCRIPT}")
 
     use_data_dir = _resolve_data_dir(body.data_dir)
-    use_dom = (body.dom_filename or "").strip() or "DOMZone48.tif"
+    use_dom = (body.dom_filename or "").strip()
     stem = Path(use_dom).stem
     tiles = _dom_tile_paths(use_data_dir, stem)
     if not tiles:
@@ -575,21 +841,41 @@ def segment_regenerate_vis(body: SegmentRegenerateVisIn):
                     {"type": "progress", "n": regenerated, "total": total},
                     ensure_ascii=False,
                 ) + "\n"
-            yield json.dumps(
-                {
-                    "type": "done",
-                    "ok": True,
-                    "regenerated": regenerated,
-                    "data_dir": str(use_data_dir),
-                    "tile_result_dir": str(_tile_result_dir(use_data_dir)),
-                    "segmentation_result_dir": str(pkl_dir),
-                    "marked_result_dir": str(marked_dir),
-                    "dom_filename": use_dom,
-                    "score_thr": body.score_thr,
-                    "min_canopy_area_m2": body.min_canopy_area_m2,
-                },
-                ensure_ascii=False,
-            ) + "\n"
+            whole_json: str | None = None
+            whole_mark_png: str | None = None
+            whole_json_error: str | None = None
+            try:
+                p_json, p_mark = merge_tile_json_to_whole_json(
+                    dom_image=use_data_dir / use_dom,
+                    seg_result_dir=pkl_dir,
+                    marked_dir=marked_dir,
+                    score_thr=body.score_thr,
+                    min_canopy_area_m2=body.min_canopy_area_m2,
+                    tile=800,
+                    overlap=200,
+                )
+                whole_json = str(p_json)
+                whole_mark_png = str(p_mark)
+            except Exception as e:
+                whole_json_error = str(e)
+            done_payload: dict = {
+                "type": "done",
+                "ok": True,
+                "regenerated": regenerated,
+                "data_dir": str(use_data_dir),
+                "segmentation_result_dir": str(pkl_dir),
+                "marked_result_dir": str(marked_dir),
+                "dom_filename": use_dom,
+                "score_thr": body.score_thr,
+                "min_canopy_area_m2": body.min_canopy_area_m2,
+            }
+            if whole_json:
+                done_payload["whole_centers_json"] = whole_json
+            if whole_mark_png:
+                done_payload["whole_mark_png"] = whole_mark_png
+            if whole_json_error:
+                done_payload["whole_centers_json_error"] = whole_json_error
+            yield json.dumps(done_payload, ensure_ascii=False) + "\n"
         except HTTPException as e:
             yield json.dumps(
                 {"type": "error", "detail": str(e.detail)},
@@ -617,7 +903,7 @@ def segment_vis_png(
     data_dir: str | None = None,
     t: str | None = None,
 ):
-    """返回 ``tile_result/marked_result`` 下的可视化 PNG（如 *_vis.png）。"""
+    """返回 ``segmentation_result/marked_result`` 下的可视化 PNG（如 *_vis.png）。"""
     use_data_dir = _resolve_data_dir(data_dir)
     marked_dir = _marked_result_dir(use_data_dir)
     name = (filename or "").strip()
@@ -644,9 +930,9 @@ def segment_overlay_gallery(
     score_thr: float | None = None,
     min_canopy_area_m2: float | None = None,
 ):
-    """分割结果画廊：``tile_result`` 切片与 ``tile_result/marked_result`` 可视化。"""
+    """分割结果画廊：``segmentation_result`` 切片与 ``marked_result`` 可视化。"""
     use_data_dir = _resolve_data_dir(data_dir)
-    use_dom = (dom_filename or "").strip() or "DOMZone48.tif"
+    use_dom = (dom_filename or "").strip()
     stem = Path(use_dom).stem
     marked_dir = _marked_result_dir(use_data_dir)
     cache_token = (t or "").strip()
@@ -724,6 +1010,205 @@ def segment_overlay_gallery(
     return HTMLResponse(html)
 
 
+@app.get("/api/phenotype/extract")
+def phenotype_extract(
+    dom_filename: str | None = None,
+    data_dir: str | None = None,
+    chm_filename: str | None = None,
+):
+    """
+    读取 ``segmentation_result/{dom_stem}_whole_centers.json``，提取表型：
+    - 冠幅：PCA 主/次轴（已在 whole json）
+    - 树冠面积：mask_area_m2
+    - 树高：按中心点经纬度在 CHM 栅格采样（可选）
+    - 体积：树冠面积 × 树高 × 0.6
+    - DBH：由冠幅异速生长方程估算（默认使用主轴冠幅）
+    """
+    use_data_dir = _resolve_data_dir(data_dir)
+    use_dom = (dom_filename or "").strip()
+    if not use_dom:
+        raise HTTPException(status_code=400, detail="缺少 dom_filename")
+    dom_path = use_data_dir / use_dom
+    if not dom_path.is_file():
+        raise HTTPException(status_code=404, detail=f"DOM 文件不存在: {use_dom}")
+
+    stem = Path(use_dom).stem
+    whole_json = _segmentation_result_dir(use_data_dir) / f"{stem}_whole_centers.json"
+    if not whole_json.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"未找到整图 JSON: {whole_json.name}，请先在分割页完成可视化重建",
+        )
+
+    try:
+        payload = json.loads(whole_json.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"读取整图 JSON 失败: {e}") from e
+    centers = payload.get("centers") if isinstance(payload, dict) else None
+    if not isinstance(centers, list):
+        raise HTTPException(status_code=500, detail="整图 JSON 缺少 centers 列表")
+
+    # 自动 CHM：优先参数，其次 users/<id>/ 下文件名含 chm 的 tif/tiff（排除 DOM）
+    use_chm: Path | None = None
+    if chm_filename and chm_filename.strip():
+        cand = use_data_dir / chm_filename.strip()
+        if cand.is_file():
+            use_chm = cand
+    else:
+        tifs = [p for p in use_data_dir.iterdir() if p.is_file() and p.suffix.lower() in {".tif", ".tiff"}]
+        for p in sorted(tifs):
+            n = p.name.lower()
+            if p.name == use_dom:
+                continue
+            if "chm" in n:
+                use_chm = p
+                break
+
+    # 异速生长方程（可按树种区域调整）
+    # DBH(cm) = alpha * crown_major_m ** beta
+    dbh_alpha = 8.0
+    dbh_beta = 0.85
+
+    rows: list[dict] = []
+    chm_missing = 0
+
+    if use_chm is not None:
+        try:
+            import rasterio  # type: ignore
+            from rasterio.transform import rowcol  # type: ignore
+            from rasterio.warp import transform as rio_transform  # type: ignore
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"读取 CHM 需要 rasterio: {e}") from e
+
+        with rasterio.open(str(use_chm)) as chm_src:
+            arr = chm_src.read(1)
+            nodata = chm_src.nodata
+            h, w = arr.shape
+
+            def sample_height(c: dict) -> float | None:
+                lon = c.get("lon")
+                lat = c.get("lat")
+                if lon is None or lat is None:
+                    return None
+                try:
+                    lons, lats = [float(lon)], [float(lat)]
+                    if chm_src.crs and str(chm_src.crs) != "EPSG:4326":
+                        xs, ys = rio_transform("EPSG:4326", chm_src.crs, lons, lats)
+                    else:
+                        xs, ys = lons, lats
+                    rr, cc = rowcol(chm_src.transform, xs[0], ys[0])
+                    r = int(rr)
+                    cidx = int(cc)
+                    if r < 0 or cidx < 0 or r >= h or cidx >= w:
+                        return None
+                    v = float(arr[r, cidx])
+                    if nodata is not None and math.isclose(v, float(nodata), rel_tol=0.0, abs_tol=1e-8):
+                        return None
+                    if not math.isfinite(v):
+                        return None
+                    return max(0.0, v)
+                except Exception:
+                    return None
+
+            for i, c in enumerate(centers):
+                if not isinstance(c, dict):
+                    continue
+                crown_major_m = c.get("crown_major_m")
+                crown_minor_m = c.get("crown_minor_m")
+                canopy_area_m2 = c.get("mask_area_m2")
+                try:
+                    crown_major_m = float(crown_major_m) if crown_major_m is not None else None
+                    crown_minor_m = float(crown_minor_m) if crown_minor_m is not None else None
+                    canopy_area_m2 = float(canopy_area_m2) if canopy_area_m2 is not None else None
+                except (TypeError, ValueError):
+                    crown_major_m = crown_minor_m = canopy_area_m2 = None
+
+                height_m = sample_height(c)
+                if height_m is None:
+                    chm_missing += 1
+                volume_m3 = (
+                    float(canopy_area_m2) * float(height_m) * 0.6
+                    if canopy_area_m2 is not None and height_m is not None
+                    else None
+                )
+                dbh_cm = (
+                    dbh_alpha * (max(crown_major_m, 1e-6) ** dbh_beta)
+                    if crown_major_m is not None
+                    else None
+                )
+                lon = c.get("lon")
+                lat = c.get("lat")
+                if isinstance(lon, (int, float)) and isinstance(lat, (int, float)):
+                    tid = f"T_{lat:.7f}_{lon:.7f}"
+                else:
+                    tid = f"T_{i+1:05d}"
+
+                rows.append(
+                    {
+                        "tree_id": tid,
+                        "height_m": height_m,
+                        "crown_major_m": crown_major_m,
+                        "crown_minor_m": crown_minor_m,
+                        "canopy_area_m2": canopy_area_m2,
+                        "volume_m3": volume_m3,
+                        "dbh_cm": dbh_cm,
+                        "lon": lon,
+                        "lat": lat,
+                        "index": c.get("index", i),
+                    }
+                )
+    else:
+        for i, c in enumerate(centers):
+            if not isinstance(c, dict):
+                continue
+            crown_major_m = c.get("crown_major_m")
+            crown_minor_m = c.get("crown_minor_m")
+            canopy_area_m2 = c.get("mask_area_m2")
+            try:
+                crown_major_m = float(crown_major_m) if crown_major_m is not None else None
+                crown_minor_m = float(crown_minor_m) if crown_minor_m is not None else None
+                canopy_area_m2 = float(canopy_area_m2) if canopy_area_m2 is not None else None
+            except (TypeError, ValueError):
+                crown_major_m = crown_minor_m = canopy_area_m2 = None
+            dbh_cm = (
+                dbh_alpha * (max(crown_major_m, 1e-6) ** dbh_beta)
+                if crown_major_m is not None
+                else None
+            )
+            lon = c.get("lon")
+            lat = c.get("lat")
+            if isinstance(lon, (int, float)) and isinstance(lat, (int, float)):
+                tid = f"T_{lat:.7f}_{lon:.7f}"
+            else:
+                tid = f"T_{i+1:05d}"
+            rows.append(
+                {
+                    "tree_id": tid,
+                    "height_m": None,
+                    "crown_major_m": crown_major_m,
+                    "crown_minor_m": crown_minor_m,
+                    "canopy_area_m2": canopy_area_m2,
+                    "volume_m3": None,
+                    "dbh_cm": dbh_cm,
+                    "lon": lon,
+                    "lat": lat,
+                    "index": c.get("index", i),
+                }
+            )
+
+    return {
+        "ok": True,
+        "data_dir": str(use_data_dir),
+        "dom_filename": use_dom,
+        "whole_centers_json": str(whole_json),
+        "chm_filename": use_chm.name if use_chm else None,
+        "dbh_model": {"alpha": dbh_alpha, "beta": dbh_beta, "formula": "DBH(cm)=alpha*crown_major_m^beta"},
+        "rows": rows,
+        "count": len(rows),
+        "height_missing_count": chm_missing if use_chm else len(rows),
+    }
+
+
 # 可选：用 JSON 列出目录下与 DOM 相关的文件
 @app.get("/api/data/list")
 def list_data_files(data_dir: str | None = None):
@@ -739,4 +1224,4 @@ def list_data_files(data_dir: str | None = None):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("fastapi_example:app", host="0.0.0.0", port=8000)
+    uvicorn.run("fastapi_example:app", host="0.0.0.0", port=7000)

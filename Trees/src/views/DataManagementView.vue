@@ -1,7 +1,13 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted, onActivated, nextTick } from 'vue'
+import { useApiBase } from '@/composables/useApiBase'
+import { fetchSessionInit } from '@/composables/sessionInit'
+import { ensureDomTilesAndGalleryPath } from '@/lib/tilesGallery'
 
-const API_BASE = 'http://127.0.0.1:7999'
+/** 与 BreederLayout 中 KeepAlive include 一致，切换路由时保留本地已选文件与会话状态 */
+defineOptions({ name: 'DataManagementView' })
+
+const { api, apiRootHint, toAbsoluteUrl } = useApiBase()
 
 const domFile = ref<File | null>(null)
 const chmFile = ref<File | null>(null)
@@ -16,18 +22,146 @@ const chmDragOver = ref(false)
 const csvDragOver = ref(false)
 
 const loading = ref(false)
+const uploading = ref(false)
 const error = ref('')
+const sessionError = ref('')
 const apiStatus = ref<'unknown' | 'ok' | 'error'>('unknown')
+
+/** 后端返回的 data_dir，形如 users/<32位hex> */
+const userDataDir = ref<string | null>(null)
+const sessionExpiresAt = ref<number | null>(null)
+const slotsUsed = ref(0)
+const slotsMax = ref(10)
+
+const sessionHint = computed(() => {
+  if (sessionError.value) return sessionError.value
+  if (!userDataDir.value) return ''
+  const exp = sessionExpiresAt.value
+  if (exp == null) return `数据目录：${userDataDir.value}`
+  const d = new Date(exp * 1000)
+  return `数据目录：${userDataDir.value} · 会话至 ${d.toLocaleString()} 过期（Cookie 约 1 小时）`
+})
 
 async function checkHealth() {
   try {
-    console.log('checkHealth', API_BASE)
-    const r = await fetch(`${API_BASE}/health`)
+    const r = await fetch(api('/health'), { credentials: 'include' })
     apiStatus.value = r.ok ? 'ok' : 'error'
     return r.ok
   } catch {
     apiStatus.value = 'error'
     return false
+  }
+}
+
+function applySessionPayload(data: Record<string, unknown>) {
+  if (data.data_dir) userDataDir.value = String(data.data_dir)
+  sessionExpiresAt.value =
+    typeof data.expires_at === 'number' ? data.expires_at : null
+  slotsUsed.value = typeof data.slots_used === 'number' ? data.slots_used : 0
+  slotsMax.value = typeof data.slots_max === 'number' ? data.slots_max : 10
+}
+
+/** 建立/恢复会话（不要在开头清空 userDataDir，避免闪烁与误伤已选目录） */
+async function initSession() {
+  sessionError.value = ''
+  try {
+    const out = await fetchSessionInit(api)
+    if (!out.ok) {
+      if (out.reason === 'full') userDataDir.value = null
+      sessionError.value = out.detail
+      return
+    }
+    applySessionPayload(out.data)
+  } catch (e) {
+    sessionError.value = e instanceof Error ? e.message : String(e)
+  }
+}
+
+const syncPending = ref(false)
+const PHENOTYPE_REFRESH_KEY = 'trees_phenotype_refresh_pending'
+
+function buildUploadFormData(): FormData {
+  const fd = new FormData()
+  if (domFile.value) fd.append('dom', domFile.value)
+  if (chmFile.value) fd.append('chm', chmFile.value)
+  if (csvFile.value) fd.append('csv', csvFile.value)
+  return fd
+}
+
+async function postUploadOnce(): Promise<void> {
+  let r = await fetch(api('/api/user/upload'), {
+    method: 'POST',
+    credentials: 'include',
+    body: buildUploadFormData(),
+  })
+  let up = (await r.json().catch(() => ({}))) as {
+    detail?: string
+    data_dir?: string
+    saved?: string[]
+    saved_keys?: string[]
+  }
+
+  if (r.status === 401) {
+    await initSession()
+    if (sessionError.value) throw new Error(sessionError.value)
+    r = await fetch(api('/api/user/upload'), {
+      method: 'POST',
+      credentials: 'include',
+      body: buildUploadFormData(),
+    })
+    up = (await r.json().catch(() => ({}))) as {
+      detail?: string
+      data_dir?: string
+      saved?: string[]
+      saved_keys?: string[]
+    }
+  }
+
+  if (!r.ok) {
+    throw new Error(typeof up.detail === 'string' ? up.detail : r.statusText)
+  }
+  if (up.data_dir) userDataDir.value = up.data_dir
+  const keys = Array.isArray(up.saved_keys) ? up.saved_keys : []
+  if (keys.length > 0) sessionStorage.setItem(PHENOTYPE_REFRESH_KEY, '1')
+  if (keys.includes('dom') && userDataDir.value && domFile.value) {
+    sessionStorage.setItem(
+      'trees_tile_gallery_pending',
+      JSON.stringify({
+        data_dir: userDataDir.value,
+        dom_filename: domFile.value.name,
+      }),
+    )
+  }
+}
+
+/** 选择文件后自动：建会话 → 上传当前已选文件到 users/{id}/ */
+async function syncSelectedFilesToServer() {
+  if (!domFile.value && !chmFile.value && !csvFile.value) return
+  if (uploading.value) {
+    syncPending.value = true
+    return
+  }
+  uploading.value = true
+  error.value = ''
+  try {
+    const out = await fetchSessionInit(api)
+    if (!out.ok) {
+      if (out.reason === 'full') userDataDir.value = null
+      sessionError.value = out.detail
+      return
+    }
+    applySessionPayload(out.data)
+    sessionError.value = ''
+
+    await postUploadOnce()
+  } catch (e) {
+    error.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    uploading.value = false
+    if (syncPending.value) {
+      syncPending.value = false
+      void nextTick(() => syncSelectedFilesToServer())
+    }
   }
 }
 
@@ -38,29 +172,25 @@ function selectedDomFilename(): string | null {
 /** 若服务器上尚无切片则调用 split_tiff 切分，随后在新窗口打开切片画廊。 */
 async function openTileThumbnails() {
   const domFilename = selectedDomFilename()
+  if (!userDataDir.value && (domFile.value || chmFile.value || csvFile.value)) {
+    await syncSelectedFilesToServer()
+  }
+  if (!userDataDir.value) {
+    error.value = '请先选择 DOM 等文件并等待自动同步完成（或检查会话是否已满/过期）'
+    return
+  }
+  if (!domFilename) {
+    error.value = '请先选择 DOM 影像'
+    return
+  }
   loading.value = true
   error.value = ''
   try {
-    const params = new URLSearchParams()
-    params.set('data_dir', "Trees/data")
-    if (domFilename) params.set('dom_filename', domFilename)
-    const ensureUrl =
-      params.toString().length > 0
-        ? `${API_BASE}/api/tiles/ensure?${params}`
-        : `${API_BASE}/api/tiles/ensure`
-    const r = await fetch(ensureUrl, { method: 'POST' })
-    const data = await r.json().catch(() => ({}))
-    if (!r.ok) throw new Error(typeof data.detail === 'string' ? data.detail : r.statusText)
-    const galleryParams = new URLSearchParams()
-    if (data.dom_filename) galleryParams.set('dom_filename', data.dom_filename)
-    else if (domFilename) galleryParams.set('dom_filename', domFilename)
-    if (data.data_dir) galleryParams.set('data_dir', data.data_dir)
-    const galleryQs = galleryParams.toString()
-    const galleryUrl =
-      galleryQs.length > 0
-        ? `${API_BASE}/api/tiles/gallery?${galleryQs}`
-        : `${API_BASE}/api/tiles/gallery`
-    window.open(galleryUrl, '_blank', 'noopener,noreferrer')
+    const { tilesGalleryPath } = await ensureDomTilesAndGalleryPath(api, {
+      data_dir: userDataDir.value,
+      dom_filename: domFilename,
+    })
+    window.open(toAbsoluteUrl(tilesGalleryPath), '_blank', 'noopener,noreferrer')
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
   } finally {
@@ -93,18 +223,21 @@ function onDomInputChange(e: Event) {
   const f = input.files?.[0]
   setDomFile(f ?? null)
   input.value = ''
+  void syncSelectedFilesToServer()
 }
 function onChmInputChange(e: Event) {
   const input = e.target as HTMLInputElement
   const f = input.files?.[0]
   setChmFile(f ?? null)
   input.value = ''
+  void syncSelectedFilesToServer()
 }
 function onCsvInputChange(e: Event) {
   const input = e.target as HTMLInputElement
   const f = input.files?.[0]
   setCsvFile(f ?? null)
   input.value = ''
+  void syncSelectedFilesToServer()
 }
 
 function allowTif(file: File) {
@@ -118,29 +251,49 @@ function allowCsv(file: File) {
 function onDomDrop(e: DragEvent) {
   domDragOver.value = false
   const f = e.dataTransfer?.files?.[0]
-  if (f && allowTif(f)) setDomFile(f)
+  if (f && allowTif(f)) {
+    setDomFile(f)
+    void syncSelectedFilesToServer()
+  }
 }
 
 function onChmDrop(e: DragEvent) {
   chmDragOver.value = false
   const f = e.dataTransfer?.files?.[0]
-  if (f && allowTif(f)) setChmFile(f)
+  if (f && allowTif(f)) {
+    setChmFile(f)
+    void syncSelectedFilesToServer()
+  }
 }
 
 function onCsvDrop(e: DragEvent) {
   csvDragOver.value = false
   const f = e.dataTransfer?.files?.[0]
-  if (f && allowCsv(f)) setCsvFile(f)
+  if (f && allowCsv(f)) {
+    setCsvFile(f)
+    void syncSelectedFilesToServer()
+  }
 }
 
-onMounted(() => {
-  checkHealth()
+onMounted(async () => {
+  await checkHealth()
+  if (apiStatus.value === 'ok') await initSession()
+})
+
+/** 从其他页返回时同步会话信息（Cookie 仍有效则刷新 data_dir / 过期时间展示） */
+onActivated(async () => {
+  if (apiStatus.value === 'ok') await initSession()
 })
 </script>
 
 <template>
   <div class="page">
     <h1 class="page-title">📁 数据管理</h1>
+
+    <p v-if="sessionHint" class="session-line">{{ sessionHint }}</p>
+    <p v-if="!sessionError && userDataDir" class="slots-line">
+      当前活跃会话：{{ slotsUsed }} / {{ slotsMax }}
+    </p>
 
     <section class="group">
       <h2>DOM影像</h2>
@@ -223,11 +376,13 @@ onMounted(() => {
       </div>
     </section>
 
+    <p v-if="uploading" class="upload-hint">正在同步到服务器…</p>
+
     <section class="group actions-row">
       <button
         type="button"
         class="btn btn-primary"
-        :disabled="loading || apiStatus !== 'ok'"
+        :disabled="loading || apiStatus !== 'ok' || !!sessionError || !userDataDir"
         @click="openTileThumbnails"
       >
         {{ loading ? '准备中…' : '查看 DOM 切片缩略图' }}
@@ -235,6 +390,9 @@ onMounted(() => {
       <p v-if="error" class="error">{{ error }}</p>
     </section>
 
+    <p v-if="apiStatus !== 'ok'" class="api-warn">
+      API 未就绪（{{ apiRootHint }}）。开发环境请将 <code class="code-inline">VITE_API_BASE_URL</code> 留空以走 Vite 代理，避免会话 Cookie 丢失。
+    </p>
   </div>
 </template>
 
@@ -243,6 +401,31 @@ onMounted(() => {
   font-size: 1.25rem;
   font-weight: bold;
   margin-bottom: 1rem;
+}
+
+.session-line {
+  font-size: 0.88rem;
+  color: #9ccc9c;
+  margin: 0 0 0.35rem 0;
+  line-height: 1.4;
+  word-break: break-all;
+}
+
+.slots-line {
+  font-size: 0.82rem;
+  color: #888;
+  margin: 0 0 1rem 0;
+}
+
+.upload-hint {
+  font-size: 0.88rem;
+  color: #ffb74d;
+  margin: 0 0 0.75rem 0;
+}
+
+.code-inline {
+  font-size: 0.85em;
+  color: #9ccc9c;
 }
 
 .group {
@@ -279,7 +462,9 @@ onMounted(() => {
   justify-content: center;
   gap: 0.25rem;
   cursor: pointer;
-  transition: border-color 0.15s, background 0.15s;
+  transition:
+    border-color 0.15s,
+    background 0.15s;
 }
 
 .drop-zone:hover {
@@ -324,7 +509,6 @@ onMounted(() => {
 
 .btn {
   padding: 8px 15px;
-  background: #4a5b7c;
   color: #fff;
   border: none;
   border-radius: 4px;
@@ -333,7 +517,7 @@ onMounted(() => {
 }
 
 .btn:hover:not(:disabled) {
-  background: #5a6b8c;
+  filter: brightness(1.08);
 }
 
 .btn:disabled {
@@ -341,17 +525,12 @@ onMounted(() => {
   cursor: not-allowed;
 }
 
+.btn-secondary {
+  background: #4a5b7c;
+}
+
 .btn-primary {
   background: #2d5a3d;
-}
-
-.btn-primary:hover:not(:disabled) {
-  background: #3d6a4d;
-}
-
-.muted {
-  color: #888;
-  font-size: 0.9rem;
 }
 
 .error {
@@ -359,16 +538,9 @@ onMounted(() => {
   font-size: 0.9rem;
 }
 
-.preview-area {
-  padding: 1.5rem;
-  background: #2b2b2b;
-  border: 1px dashed #555;
-  border-radius: 6px;
-  min-height: 120px;
-}
-
-.code-inline {
-  font-size: 0.85em;
-  color: #9ccc9c;
+.api-warn {
+  font-size: 0.85rem;
+  color: #ffb74d;
+  margin-top: 0.5rem;
 }
 </style>

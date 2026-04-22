@@ -23,9 +23,9 @@ import { RouterLink, RouterView } from 'vue-router'
       </section>
     </aside>
     <main class="main-content">
-      <!-- 仅缓存单木分割：离开路由后组件不销毁，进度与流式请求继续在本实例上更新 -->
+      <!-- 缓存后切换路由不销毁实例：单木分割进度、数据管理已选文件与预览得以保留 -->
       <RouterView v-slot="{ Component }">
-        <KeepAlive :include="['TreeSegmentationView']">
+        <KeepAlive :include="['TreeSegmentationView', 'DataManagementView']">
           <component :is="Component" />
         </KeepAlive>
       </RouterView>

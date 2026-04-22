@@ -1,10 +1,17 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onActivated, watch } from 'vue'
+import { useApiBase } from '@/composables/useApiBase'
+import { fetchSessionInit } from '@/composables/sessionInit'
+import { forEachNdjsonObject } from '@/lib/ndjson'
+import { pickDomFromFiles } from '@/lib/userWorkspace'
+import { ensureDomTilesAndGalleryPath } from '@/lib/tilesGallery'
 
 /** 供布局中 KeepAlive include 匹配，切换路由时保留本页实例与进行中的分割/可视化任务 */
 defineOptions({ name: 'TreeSegmentationView' })
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:7000'
+const { api, apiRootHint, toAbsoluteUrl } = useApiBase()
+
+const DEFAULT_DOM_FILENAME = 'DOMZone48.tif'
 
 /** 仅使用 Mask R-CNN */
 const model = ref('Mask R-CNN')
@@ -14,7 +21,10 @@ const confidence = ref(80)
 /** 最小树冠面积（m²），与后端掩膜×像元面积一致；无地理坐标时像元面积按 1 等效为像素数 */
 const minArea = ref(0)
 
-const domFilename = ref('DOMZone48.tif')
+/** Cookie 会话对应的数据目录（如 users/ 下 32 位 id），与数据管理上传位置一致 */
+const userDataDir = ref<string | null>(null)
+
+const domFilename = ref(DEFAULT_DOM_FILENAME)
 const progress = ref(0)
 const segmenting = ref(false)
 const regeneratingVis = ref(false)
@@ -48,7 +58,7 @@ watch(domFilename, () => {
 
 async function checkHealth() {
   try {
-    const r = await fetch(`${API_BASE}/health`)
+    const r = await fetch(api('/health'), { credentials: 'include' })
     apiStatus.value = r.ok ? 'ok' : 'error'
     return r.ok
   } catch {
@@ -57,146 +67,152 @@ async function checkHealth() {
   }
 }
 
+/** 读取 Cookie 会话与用户目录下已上传文件，自动填入 data_dir 与 DOM 文件名 */
+async function hydrateFromSession() {
+  try {
+    const out = await fetchSessionInit(api)
+    if (!out.ok) {
+      userDataDir.value = null
+      return
+    }
+    const data = out.data
+    userDataDir.value = typeof data.data_dir === 'string' ? data.data_dir : null
+    if (!userDataDir.value) return
+
+    const fr = await fetch(api('/api/user/files'), { credentials: 'include' })
+    if (!fr.ok) return
+    const fj = (await fr.json().catch(() => ({}))) as { files?: string[] }
+    const files = fj.files ?? []
+    const pick = pickDomFromFiles(files)
+    if (!pick) return
+    const cur = domFilename.value.trim()
+    if (!cur || cur === DEFAULT_DOM_FILENAME || !files.includes(cur)) {
+      domFilename.value = pick
+    }
+  } catch {
+    userDataDir.value = null
+  }
+}
+
+const TILE_GALLERY_PENDING_KEY = 'trees_tile_gallery_pending'
+
+/** 数据管理页上传 DOM 后写入 sessionStorage，进入本页时自动切分并打开切片画廊 */
+async function tryOpenTilesAfterUploadIntent(): Promise<void> {
+  const raw = sessionStorage.getItem(TILE_GALLERY_PENDING_KEY)
+  if (!raw) return
+  sessionStorage.removeItem(TILE_GALLERY_PENDING_KEY)
+  let o: { data_dir?: string; dom_filename?: string }
+  try {
+    o = JSON.parse(raw) as { data_dir?: string; dom_filename?: string }
+  } catch {
+    return
+  }
+  const dd = o.data_dir?.trim()
+  const dom = o.dom_filename?.trim()
+  if (!dd || !dom) return
+  await hydrateFromSession()
+  if (userDataDir.value !== dd) return
+  domFilename.value = dom
+  try {
+    const { tilesGalleryPath } = await ensureDomTilesAndGalleryPath(api, {
+      data_dir: dd,
+      dom_filename: dom,
+    })
+    window.open(toAbsoluteUrl(tilesGalleryPath), '_blank', 'noopener,noreferrer')
+  } catch (e) {
+    errorMsg.value = e instanceof Error ? e.message : String(e)
+  }
+}
+
 function galleryUrl(cacheBust?: number): string {
   const p = new URLSearchParams()
   if (domFilename.value.trim()) p.set('dom_filename', domFilename.value.trim())
   p.set('score_thr', String(scoreThr.value))
   p.set('min_canopy_area_m2', String(minArea.value))
+  if (userDataDir.value) p.set('data_dir', userDataDir.value)
   if (cacheBust != null) p.set('t', String(cacheBust))
   const qs = p.toString()
-  return qs.length > 0
-    ? `${API_BASE}/api/segment/gallery?${qs}`
-    : `${API_BASE}/api/segment/gallery`
+  return qs.length > 0 ? api(`/api/segment/gallery?${qs}`) : api('/api/segment/gallery')
 }
 
-/** 原始数据区：查看 800×800 小图（不按当前阈值重算可视化） */
-function openSegmentedTileGallery() {
+/** 原始数据区：查看 800×800 切片（与数据管理「DOM 切片缩略图」相同，不含树心标注） */
+async function openSegmentedTileGallery() {
   errorMsg.value = ''
-  window.open(galleryUrl(Date.now()), '_blank', 'noopener,noreferrer')
+  const dom = domFilename.value.trim()
+  if (!userDataDir.value) {
+    errorMsg.value = '请先建立会话并在数据管理中上传 DOM'
+    return
+  }
+  if (!dom) {
+    errorMsg.value = '请填写 DOM 文件名'
+    return
+  }
+  try {
+    const { tilesGalleryPath } = await ensureDomTilesAndGalleryPath(api, {
+      data_dir: userDataDir.value,
+      dom_filename: dom,
+    })
+    window.open(toAbsoluteUrl(tilesGalleryPath), '_blank', 'noopener,noreferrer')
+  } catch (e) {
+    errorMsg.value = e instanceof Error ? e.message : String(e)
+  }
 }
 
 async function streamRegenerateVis(dom: string): Promise<void> {
-  const r = await fetch(`${API_BASE}/api/segment/regenerate-vis`, {
+  const payload: Record<string, unknown> = {
+    dom_filename: dom,
+    score_thr: scoreThr.value,
+    min_canopy_area_m2: minArea.value,
+  }
+  if (userDataDir.value) payload.data_dir = userDataDir.value
+
+  const r = await fetch(api('/api/segment/regenerate-vis'), {
     method: 'POST',
+    credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
       Accept: 'application/x-ndjson, application/json',
     },
-    body: JSON.stringify({
-      dom_filename: dom,
-      score_thr: scoreThr.value,
-      min_canopy_area_m2: minArea.value,
-    }),
+    body: JSON.stringify(payload),
   })
   if (!r.ok) {
     const data = await r.json().catch(() => ({}))
     const d = data.detail
     throw new Error(typeof d === 'string' ? d : r.statusText)
   }
-  const body = r.body
-  if (!body) throw new Error('无法读取响应流')
 
-  const reader = body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
   let sawDone = false
-
-  type NdMsg = { type?: string; n?: number; total?: number; detail?: string }
-  const handleObj = (msg: NdMsg) => {
+  await forEachNdjsonObject(r.body, (msg) => {
     if (msg.type === 'progress' && msg.total != null && msg.n != null) {
-      visProgress.value = { n: msg.n, total: msg.total }
+      visProgress.value = { n: msg.n as number, total: msg.total as number }
     } else if (msg.type === 'done') {
       sawDone = true
     } else if (msg.type === 'error') {
       throw new Error(typeof msg.detail === 'string' ? msg.detail : '可视化失败')
     }
-  }
-
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    const lines = buffer.split('\n')
-    buffer = lines.pop() ?? ''
-    for (const line of lines) {
-      if (!line.trim()) continue
-      try {
-        handleObj(JSON.parse(line) as NdMsg)
-      } catch (e) {
-        if (e instanceof SyntaxError) continue
-        throw e
-      }
-    }
-  }
-  if (buffer.trim()) {
-    try {
-      handleObj(JSON.parse(buffer.trim()) as NdMsg)
-    } catch (e) {
-      if (!(e instanceof SyntaxError)) throw e
-    }
-  }
-  if (!sawDone) {
-    throw new Error('可视化未完成：服务器提前结束响应')
-  }
+  })
+  if (!sawDone) throw new Error('可视化未完成：服务器提前结束响应')
 }
 
 /** 消费 /api/segment/run 的 NDJSON 流，更新 segmentProgress / progress，返回 processed */
 async function consumeSegmentRunStream(r: Response): Promise<number> {
-  const body = r.body
-  if (!body) throw new Error('无法读取响应流')
-
-  const reader = body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
   let sawDone = false
   let processed = 0
 
-  type NdMsg = {
-    type?: string
-    n?: number
-    total?: number
-    detail?: string
-    processed?: number
-  }
-  const handleObj = (msg: NdMsg) => {
+  await forEachNdjsonObject(r.body, (msg) => {
     if (msg.type === 'progress' && msg.total != null && msg.n != null) {
-      segmentProgress.value = { n: msg.n, total: msg.total }
-      progress.value =
-        msg.total > 0 ? Math.min(100, Math.round((msg.n / msg.total) * 100)) : 0
+      const n = msg.n as number
+      const t = msg.total as number
+      segmentProgress.value = { n, total: t }
+      progress.value = t > 0 ? Math.min(100, Math.round((n / t) * 100)) : 0
     } else if (msg.type === 'done') {
       sawDone = true
       if (typeof msg.processed === 'number') processed = msg.processed
     } else if (msg.type === 'error') {
       throw new Error(typeof msg.detail === 'string' ? msg.detail : '分割失败')
     }
-  }
-
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    const lines = buffer.split('\n')
-    buffer = lines.pop() ?? ''
-    for (const line of lines) {
-      if (!line.trim()) continue
-      try {
-        handleObj(JSON.parse(line) as NdMsg)
-      } catch (e) {
-        if (e instanceof SyntaxError) continue
-        throw e
-      }
-    }
-  }
-  if (buffer.trim()) {
-    try {
-      handleObj(JSON.parse(buffer.trim()) as NdMsg)
-    } catch (e) {
-      if (!(e instanceof SyntaxError)) throw e
-    }
-  }
-  if (!sawDone) {
-    throw new Error('分割未完成：服务器提前结束响应')
-  }
+  })
+  if (!sawDone) throw new Error('分割未完成：服务器提前结束响应')
   return processed
 }
 
@@ -204,11 +220,13 @@ async function consumeSegmentRunStream(r: Response): Promise<number> {
 async function openResultGallery() {
   errorMsg.value = ''
   if (apiStatus.value !== 'ok') return
-  const dom = domFilename.value.trim() || 'DOMZone48.tif'
+  const dom = domFilename.value.trim()
   try {
-    const st = await fetch(
-      `${API_BASE}/api/segment/has-existing?${new URLSearchParams({ dom_filename: dom })}`,
-    )
+    const hp = new URLSearchParams({ dom_filename: dom })
+    if (userDataDir.value) hp.set('data_dir', userDataDir.value)
+    const st = await fetch(api(`/api/segment/has-existing?${hp.toString()}`), {
+      credentials: 'include',
+    })
     const stJson = await st.json().catch(() => ({}))
     if (!st.ok) throw new Error(typeof stJson.detail === 'string' ? stJson.detail : st.statusText)
 
@@ -240,7 +258,7 @@ async function openResultGallery() {
       }
     }
 
-    window.open(galleryUrl(Date.now()), '_blank', 'noopener,noreferrer')
+    window.open(toAbsoluteUrl(galleryUrl(Date.now())), '_blank', 'noopener,noreferrer')
   } catch (e) {
     errorMsg.value = e instanceof Error ? e.message : String(e)
     regeneratingVis.value = false
@@ -260,9 +278,11 @@ async function startSegmentation() {
   const dom = domFilename.value.trim()
 
   try {
-    const st = await fetch(
-      `${API_BASE}/api/segment/has-existing?${new URLSearchParams({ dom_filename: dom })}`,
-    )
+    const hp = new URLSearchParams({ dom_filename: dom })
+    if (userDataDir.value) hp.set('data_dir', userDataDir.value)
+    const st = await fetch(api(`/api/segment/has-existing?${hp.toString()}`), {
+      credentials: 'include',
+    })
     const stJson = await st.json().catch(() => ({}))
     if (!st.ok) throw new Error(typeof stJson.detail === 'string' ? stJson.detail : st.statusText)
 
@@ -284,18 +304,22 @@ async function startSegmentation() {
     progress.value = 0
     segmentProgress.value = null
 
-    const r = await fetch(`${API_BASE}/api/segment/run`, {
+    const runBody: Record<string, unknown> = {
+      dom_filename: dom,
+      overwrite,
+      score_thr: scoreThr.value,
+      min_canopy_area_m2: minArea.value,
+    }
+    if (userDataDir.value) runBody.data_dir = userDataDir.value
+
+    const r = await fetch(api('/api/segment/run'), {
       method: 'POST',
+      credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/x-ndjson, application/json',
       },
-      body: JSON.stringify({
-        dom_filename: dom,
-        overwrite,
-        score_thr: scoreThr.value,
-        min_canopy_area_m2: minArea.value,
-      }),
+      body: JSON.stringify(runBody),
     })
     if (!r.ok) {
       const data = await r.json().catch(() => ({}))
@@ -317,8 +341,19 @@ async function startSegmentation() {
   }
 }
 
-onMounted(() => {
-  checkHealth()
+onMounted(async () => {
+  await checkHealth()
+  if (apiStatus.value === 'ok') {
+    await hydrateFromSession()
+    await tryOpenTilesAfterUploadIntent()
+  }
+})
+
+onActivated(async () => {
+  if (apiStatus.value === 'ok') {
+    await hydrateFromSession()
+    await tryOpenTilesAfterUploadIntent()
+  }
 })
 </script>
 
@@ -338,7 +373,7 @@ onMounted(() => {
           v-model="domFilename"
           type="text"
           class="input"
-          placeholder="与服务器数据目录中 TIFF 同名，如 DOMZone48.tif"
+          placeholder="与数据管理上传的 DOM 同名；有会话时将自动填入"
         />
         <label>置信度阈值:</label>
         <div class="slider-row">
@@ -355,7 +390,7 @@ onMounted(() => {
         />
       </div>
       <p v-if="apiStatus !== 'ok'" class="api-warn">
-        API 未就绪（{{ API_BASE }}）。请启动后端并配置 VITE_API_BASE_URL。
+        API 未就绪（{{ apiRootHint }}）。开发环境建议 VITE_API_BASE_URL 留空以走代理。
       </p>
     </section>
 
@@ -364,8 +399,9 @@ onMounted(() => {
         <h2>原始数据</h2>
         <div class="tile-panel">
           <p class="panel-hint">
-            对应 DOM 切分后的 800×800 影像块（服务器目录
-            <code class="code">tile_result/</code>）；本按钮仅浏览切片图，不含树心标注。
+            对应 DOM 切分后的 800×800 影像块（与 pkl 同在服务器目录
+            <code class="code">segmentation_result/</code>）；本按钮仅浏览原始切片，不含树心标注。上传新 DOM
+            后进入本页会自动切分并打开缩略图画廊。
           </p>
           <button
             type="button"
@@ -373,7 +409,7 @@ onMounted(() => {
             :disabled="apiStatus !== 'ok'"
             @click="openSegmentedTileGallery"
           >
-            查看分割后的 800×800 小图
+            查看 DOM 切片缩略图
           </button>
         </div>
       </section>
@@ -390,8 +426,8 @@ onMounted(() => {
         >
           <p class="panel-hint">
             点击本区域查看标明<strong>每棵树中心</strong>的子图（读取
-            <code class="code">tile_result/marked_result/</code> 中的树中心可视化；pkl 在
-            <code class="code">segmentation_result/</code>。
+            <code class="code">segmentation_result/marked_result/</code>；pkl 与切片同在
+            <code class="code">segmentation_result/</code>）。
           </p>
           <p class="panel-sub">
             拖动<strong>置信度阈值</strong>或修改<strong>最小树冠面积</strong>后，若与上次预览参数不同，再次点击才会调用
