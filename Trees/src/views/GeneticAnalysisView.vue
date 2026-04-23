@@ -46,7 +46,7 @@ function runAnalysis() {
   let i = 0
   const t = setInterval(() => {
     if (i < steps.length) {
-      analysisLog.value.push(steps[i])
+      analysisLog.value.push(steps[i]!)
       progress.value = Math.round(((i + 1) / steps.length) * 100)
       i++
     } else {

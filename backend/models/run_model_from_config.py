@@ -4,9 +4,9 @@
 
 在仓库 `Trees` 目录下运行::
 
-    python run_model_from_config.py \\
-        --config Models/20230430_224903_config3.py \\
-        --checkpoint Models/20250416_001154_epoch36_latest.pth
+    python backend/models/run_model_from_config.py \\
+        --config backend/models/20230430_224903_config3.py \\
+        --checkpoint backend/models/20250416_001154_epoch36_latest.pth
 
 需已安装 mmdet、mmcv（及 mmengine，若使用 MMDet 3.x）。
 """

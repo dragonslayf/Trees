@@ -1,7 +1,5 @@
 """
-自定义 MMDetection 模块：从本仓库 `Models/` 加载真实的 TreeNet、TREEFPN（非占位实现）。
-
-使用前请将仓库 `Trees` 目录加入 PYTHONPATH，或在 `Trees` 目录下运行脚本。
+自定义 MMDetection 模块：加载同目录下的 TreeNet、TREEFPN（非占位实现）。
 
 在 config 中可写（推荐）::
     custom_imports = dict(imports=['mmdet_custom_models'], allow_failed_imports=False)
@@ -13,9 +11,8 @@ import sys
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent
-_MODELS_DIR = _ROOT / "Models"
-if _MODELS_DIR.is_dir() and str(_MODELS_DIR) not in sys.path:
-    sys.path.insert(0, str(_MODELS_DIR))
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 # TreeNet.py / TreeFPN.py 在导入末尾会向 mmdet 注册
 _tree_net_mod = importlib.import_module("TreeNet")

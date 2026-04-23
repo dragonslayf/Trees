@@ -9,6 +9,13 @@ import vueDevTools from 'vite-plugin-vue-devtools'
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   const proxyTarget = env.VITE_PROXY_TARGET || 'http://127.0.0.1:7000'
+  const previewAllowedHosts = (
+    env.VITE_PREVIEW_ALLOWED_HOSTS ||
+    'hugetreesegmentation.click,api.hugetreesegmentation.click,localhost,127.0.0.1'
+  )
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
 
   return {
     plugins: [
@@ -27,6 +34,9 @@ export default defineConfig(({ mode }) => {
         '/api': { target: proxyTarget, changeOrigin: true },
         '/health': { target: proxyTarget, changeOrigin: true },
       },
+    },
+    preview: {
+      allowedHosts: previewAllowedHosts,
     },
   }
 })

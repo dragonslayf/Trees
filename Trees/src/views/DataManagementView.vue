@@ -39,7 +39,7 @@ const sessionHint = computed(() => {
   const exp = sessionExpiresAt.value
   if (exp == null) return `数据目录：${userDataDir.value}`
   const d = new Date(exp * 1000)
-  return `数据目录：${userDataDir.value} · 会话至 ${d.toLocaleString()} 过期（Cookie 约 1 小时）`
+  return `会话至 ${d.toLocaleString()} 过期（Cookie 约 1 小时）`
 })
 
 async function checkHealth() {
@@ -123,15 +123,6 @@ async function postUploadOnce(): Promise<void> {
   if (up.data_dir) userDataDir.value = up.data_dir
   const keys = Array.isArray(up.saved_keys) ? up.saved_keys : []
   if (keys.length > 0) sessionStorage.setItem(PHENOTYPE_REFRESH_KEY, '1')
-  if (keys.includes('dom') && userDataDir.value && domFile.value) {
-    sessionStorage.setItem(
-      'trees_tile_gallery_pending',
-      JSON.stringify({
-        data_dir: userDataDir.value,
-        dom_filename: domFile.value.name,
-      }),
-    )
-  }
 }
 
 /** 选择文件后自动：建会话 → 上传当前已选文件到 users/{id}/ */

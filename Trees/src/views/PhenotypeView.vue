@@ -243,8 +243,7 @@ onActivated(() => {
     <h1 class="page-title">📊 表型提取与整理</h1>
 
     <section class="group">
-      <h2>自动提取状态</h2>
-      <p class="hint" v-if="userDataDir">data_dir: {{ userDataDir }}</p>
+      
       <p class="hint">DOM: {{ currentDom || '未找到' }}</p>
       <p class="hint">CHM: {{ currentChm || '未提供（树高留空）' }}</p>
       <p class="hint" v-if="apiStatus !== 'ok'">API 未就绪（{{ apiRootHint }}）</p>

@@ -4,7 +4,6 @@ import { useApiBase } from '@/composables/useApiBase'
 import { fetchSessionInit } from '@/composables/sessionInit'
 import { forEachNdjsonObject } from '@/lib/ndjson'
 import { pickDomFromFiles } from '@/lib/userWorkspace'
-import { ensureDomTilesAndGalleryPath } from '@/lib/tilesGallery'
 
 /** 供布局中 KeepAlive include 匹配，切换路由时保留本页实例与进行中的分割/可视化任务 */
 defineOptions({ name: 'TreeSegmentationView' })
@@ -94,36 +93,6 @@ async function hydrateFromSession() {
   }
 }
 
-const TILE_GALLERY_PENDING_KEY = 'trees_tile_gallery_pending'
-
-/** 数据管理页上传 DOM 后写入 sessionStorage，进入本页时自动切分并打开切片画廊 */
-async function tryOpenTilesAfterUploadIntent(): Promise<void> {
-  const raw = sessionStorage.getItem(TILE_GALLERY_PENDING_KEY)
-  if (!raw) return
-  sessionStorage.removeItem(TILE_GALLERY_PENDING_KEY)
-  let o: { data_dir?: string; dom_filename?: string }
-  try {
-    o = JSON.parse(raw) as { data_dir?: string; dom_filename?: string }
-  } catch {
-    return
-  }
-  const dd = o.data_dir?.trim()
-  const dom = o.dom_filename?.trim()
-  if (!dd || !dom) return
-  await hydrateFromSession()
-  if (userDataDir.value !== dd) return
-  domFilename.value = dom
-  try {
-    const { tilesGalleryPath } = await ensureDomTilesAndGalleryPath(api, {
-      data_dir: dd,
-      dom_filename: dom,
-    })
-    window.open(toAbsoluteUrl(tilesGalleryPath), '_blank', 'noopener,noreferrer')
-  } catch (e) {
-    errorMsg.value = e instanceof Error ? e.message : String(e)
-  }
-}
-
 function galleryUrl(cacheBust?: number): string {
   const p = new URLSearchParams()
   if (domFilename.value.trim()) p.set('dom_filename', domFilename.value.trim())
@@ -133,29 +102,6 @@ function galleryUrl(cacheBust?: number): string {
   if (cacheBust != null) p.set('t', String(cacheBust))
   const qs = p.toString()
   return qs.length > 0 ? api(`/api/segment/gallery?${qs}`) : api('/api/segment/gallery')
-}
-
-/** 原始数据区：查看 800×800 切片（与数据管理「DOM 切片缩略图」相同，不含树心标注） */
-async function openSegmentedTileGallery() {
-  errorMsg.value = ''
-  const dom = domFilename.value.trim()
-  if (!userDataDir.value) {
-    errorMsg.value = '请先建立会话并在数据管理中上传 DOM'
-    return
-  }
-  if (!dom) {
-    errorMsg.value = '请填写 DOM 文件名'
-    return
-  }
-  try {
-    const { tilesGalleryPath } = await ensureDomTilesAndGalleryPath(api, {
-      data_dir: userDataDir.value,
-      dom_filename: dom,
-    })
-    window.open(toAbsoluteUrl(tilesGalleryPath), '_blank', 'noopener,noreferrer')
-  } catch (e) {
-    errorMsg.value = e instanceof Error ? e.message : String(e)
-  }
 }
 
 async function streamRegenerateVis(dom: string): Promise<void> {
@@ -220,6 +166,10 @@ async function consumeSegmentRunStream(r: Response): Promise<number> {
 async function openResultGallery() {
   errorMsg.value = ''
   if (apiStatus.value !== 'ok') return
+  if (segmenting.value) {
+    errorMsg.value = '正在分割中，请等待分割完成后再查看预览。'
+    return
+  }
   const dom = domFilename.value.trim()
   try {
     const hp = new URLSearchParams({ dom_filename: dom })
@@ -269,7 +219,7 @@ async function openResultGallery() {
 function onResultPanelKeydown(e: KeyboardEvent) {
   if (e.key === 'Enter' || e.key === ' ') {
     e.preventDefault()
-    if (apiStatus.value === 'ok' && !regeneratingVis.value) openResultGallery()
+    if (apiStatus.value === 'ok' && !regeneratingVis.value && !segmenting.value) openResultGallery()
   }
 }
 
@@ -345,14 +295,13 @@ onMounted(async () => {
   await checkHealth()
   if (apiStatus.value === 'ok') {
     await hydrateFromSession()
-    await tryOpenTilesAfterUploadIntent()
   }
 })
 
 onActivated(async () => {
+  await checkHealth()
   if (apiStatus.value === 'ok') {
     await hydrateFromSession()
-    await tryOpenTilesAfterUploadIntent()
   }
 })
 </script>
@@ -392,53 +341,40 @@ onActivated(async () => {
       <p v-if="apiStatus !== 'ok'" class="api-warn">
         API 未就绪（{{ apiRootHint }}）。开发环境建议 VITE_API_BASE_URL 留空以走代理。
       </p>
+      <div class="button-row">
+        <button
+          type="button"
+          class="btn btn-primary"
+          :disabled="segmenting || apiStatus !== 'ok'"
+          @click="startSegmentation"
+        >
+          {{ segmenting ? '分割中（调用 run_model_from_config.py）…' : '开始分割' }}
+        </button>
+      </div>
     </section>
 
-    <div class="viz-row">
-      <section class="group half">
-        <h2>原始数据</h2>
-        <div class="tile-panel">
-          <p class="panel-hint">
-            对应 DOM 切分后的 800×800 影像块（与 pkl 同在服务器目录
-            <code class="code">segmentation_result/</code>）；本按钮仅浏览原始切片，不含树心标注。上传新 DOM
-            后进入本页会自动切分并打开缩略图画廊。
-          </p>
-          <button
-            type="button"
-            class="btn btn-secondary"
-            :disabled="apiStatus !== 'ok'"
-            @click="openSegmentedTileGallery"
-          >
-            查看 DOM 切片缩略图
-          </button>
-        </div>
-      </section>
-      <section class="group half">
-        <h2>分割结果</h2>
-        <div
-          class="tile-panel tile-panel--clickable"
-          role="button"
-          tabindex="0"
-          :aria-busy="regeneratingVis"
-          :aria-disabled="apiStatus !== 'ok' || regeneratingVis"
-          @click="apiStatus === 'ok' && !regeneratingVis && openResultGallery()"
-          @keydown="onResultPanelKeydown"
+    <section class="group">
+      <h2>分割结果</h2>
+      <div
+        class="tile-panel tile-panel--clickable"
+        role="button"
+        tabindex="0"
+        :aria-busy="regeneratingVis || segmenting"
+        :aria-disabled="apiStatus !== 'ok' || regeneratingVis || segmenting"
+        @click="apiStatus === 'ok' && !regeneratingVis && !segmenting && openResultGallery()"
+        @keydown="onResultPanelKeydown"
+      >
+        
+        <button
+          type="button"
+          class="btn btn-secondary"
+          :disabled="apiStatus !== 'ok' || regeneratingVis || segmenting"
+          @click.stop="openResultGallery"
         >
-          <p class="panel-hint">
-            点击本区域查看标明<strong>每棵树中心</strong>的子图（读取
-            <code class="code">segmentation_result/marked_result/</code>；pkl 与切片同在
-            <code class="code">segmentation_result/</code>）。
-          </p>
-          <p class="panel-sub">
-            拖动<strong>置信度阈值</strong>或修改<strong>最小树冠面积</strong>后，若与上次预览参数不同，再次点击才会调用
-            <code class="code">visualize_pkl_mask_centers.py</code>
-            重绘；参数未变则直接打开画廊。输出文件带参数后缀，已存在则跳过生成。
-          </p>
-          <span v-if="regeneratingVis && !visProgress" class="panel-status">正在准备可视化…</span>
-          <span v-else-if="!regeneratingVis" class="panel-cta">点击打开预览</span>
-        </div>
-      </section>
-    </div>
+          {{ segmenting ? '分割进行中，请稍候…' : regeneratingVis ? '正在准备可视化…' : '点击打开预览' }}
+        </button>
+      </div>
+    </section>
 
     <div v-if="regeneratingVis && visProgress" class="vis-progress-block">
       <p class="vis-progress-label">
@@ -462,19 +398,6 @@ onActivated(async () => {
       />
     </div>
 
-    <div class="button-row">
-      <button
-        type="button"
-        class="btn btn-primary"
-        :disabled="segmenting || apiStatus !== 'ok'"
-        @click="startSegmentation"
-      >
-        {{ segmenting ? '分割中（调用 run_model_from_config.py）…' : '开始分割' }}
-      </button>
-      <div class="progress-wrap">
-        <progress :value="progress" max="100" class="progress-bar" />
-      </div>
-    </div>
     <p v-if="errorMsg" class="error">{{ errorMsg }}</p>
   </div>
 </template>
