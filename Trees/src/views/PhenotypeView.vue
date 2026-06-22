@@ -2,7 +2,7 @@
 import { computed, onActivated, onMounted, ref } from 'vue'
 import { useApiBase } from '@/composables/useApiBase'
 import { fetchSessionInit } from '@/composables/sessionInit'
-import { pickDomFromFiles } from '@/lib/userWorkspace'
+import { pickDomFromFiles, type UploadManifest } from '@/lib/userWorkspace'
 
 defineOptions({ name: 'PhenotypeView' })
 
@@ -76,12 +76,23 @@ async function hydrateSessionAndFiles() {
 
   const fr = await fetch(api('/api/user/files'), { credentials: 'include' })
   if (!fr.ok) throw new Error('读取用户文件列表失败')
-  const fj = (await fr.json().catch(() => ({}))) as { files?: string[] }
+  const fj = (await fr.json().catch(() => ({}))) as {
+    files?: string[]
+    upload_manifest?: UploadManifest
+  }
   availableFiles.value = Array.isArray(fj.files) ? fj.files : []
-  const picked = pickDomFromFiles(availableFiles.value)
-  if (picked) currentDom.value = picked
-  const chm = availableFiles.value.find((f) => /\.(tif|tiff)$/i.test(f) && /chm/i.test(f))
-  currentChm.value = chm ?? null
+  currentDom.value = pickDomFromFiles(availableFiles.value, fj.upload_manifest) ?? ''
+
+  const manifestChmRaw = fj.upload_manifest?.chm
+  const manifestChm =
+    typeof manifestChmRaw === 'string' && manifestChmRaw.trim() ? manifestChmRaw.trim() : ''
+  const manifestChmIsValid =
+    !!manifestChm &&
+    availableFiles.value.includes(manifestChm) &&
+    /\.(tif|tiff)$/i.test(manifestChm)
+
+  const fallbackChm = availableFiles.value.find((f) => /\.(tif|tiff)$/i.test(f) && /chm/i.test(f))
+  currentChm.value = manifestChmIsValid ? manifestChm : (fallbackChm ?? null)
 }
 
 async function extractPhenotypes() {

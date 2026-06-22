@@ -120,11 +120,14 @@ def create_upload_router(*, data_dir: Path) -> APIRouter:
             return {
                 "data_dir": user_session.session_data_dir_relative(sid),
                 "files": [],
+                "upload_manifest": {},
             }
         files = [p.name for p in user_dir.iterdir() if p.is_file() and not p.name.startswith(".")]
+        manifest = read_upload_manifest(user_dir)
         return {
             "data_dir": user_session.session_data_dir_relative(sid),
             "files": sorted(files),
+            "upload_manifest": manifest,
         }
 
     return router

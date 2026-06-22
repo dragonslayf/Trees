@@ -3,7 +3,7 @@ import { ref, computed, onMounted, onActivated, watch } from 'vue'
 import { useApiBase } from '@/composables/useApiBase'
 import { fetchSessionInit } from '@/composables/sessionInit'
 import { forEachNdjsonObject } from '@/lib/ndjson'
-import { pickDomFromFiles } from '@/lib/userWorkspace'
+import { pickDomFromFiles, type UploadManifest } from '@/lib/userWorkspace'
 
 /** 供布局中 KeepAlive include 匹配，切换路由时保留本页实例与进行中的分割/可视化任务 */
 defineOptions({ name: 'TreeSegmentationView' })
@@ -35,6 +35,7 @@ const errorMsg = ref('')
 const apiStatus = ref<'unknown' | 'ok' | 'error'>('unknown')
 
 const scoreThr = computed(() => Math.min(0.99, Math.max(0.01, confidence.value / 100)))
+const hasDomFilename = computed(() => domFilename.value.trim().length > 0)
 
 /** 上次用于生成「分割结果」预览图的 DOM、score_thr、min树冠面积；未变化则跳过 regenerate-vis */
 const lastResultVisDom = ref<string | null>(null)
@@ -80,14 +81,12 @@ async function hydrateFromSession() {
 
     const fr = await fetch(api('/api/user/files'), { credentials: 'include' })
     if (!fr.ok) return
-    const fj = (await fr.json().catch(() => ({}))) as { files?: string[] }
-    const files = fj.files ?? []
-    const pick = pickDomFromFiles(files)
-    if (!pick) return
-    const cur = domFilename.value.trim()
-    if (!cur || cur === DEFAULT_DOM_FILENAME || !files.includes(cur)) {
-      domFilename.value = pick
+    const fj = (await fr.json().catch(() => ({}))) as {
+      files?: string[]
+      upload_manifest?: UploadManifest
     }
+    const files = fj.files ?? []
+    domFilename.value = pickDomFromFiles(files, fj.upload_manifest) ?? ''
   } catch {
     userDataDir.value = null
   }
@@ -166,6 +165,10 @@ async function consumeSegmentRunStream(r: Response): Promise<number> {
 async function openResultGallery() {
   errorMsg.value = ''
   if (apiStatus.value !== 'ok') return
+  if (!hasDomFilename.value) {
+    errorMsg.value = '未找到 DOM 文件，请先在「数据管理」上传 DOM（.tif/.tiff）。'
+    return
+  }
   if (segmenting.value) {
     errorMsg.value = '正在分割中，请等待分割完成后再查看预览。'
     return
@@ -226,6 +229,10 @@ function onResultPanelKeydown(e: KeyboardEvent) {
 async function startSegmentation() {
   errorMsg.value = ''
   const dom = domFilename.value.trim()
+  if (!dom) {
+    errorMsg.value = '未找到 DOM 文件，请先在「数据管理」上传 DOM（.tif/.tiff）。'
+    return
+  }
 
   try {
     const hp = new URLSearchParams({ dom_filename: dom })
@@ -345,12 +352,15 @@ onActivated(async () => {
         <button
           type="button"
           class="btn btn-primary"
-          :disabled="segmenting || apiStatus !== 'ok'"
+          :disabled="segmenting || apiStatus !== 'ok' || !hasDomFilename"
           @click="startSegmentation"
         >
           {{ segmenting ? '分割中（调用 run_model_from_config.py）…' : '开始分割' }}
         </button>
       </div>
+      <p v-if="!hasDomFilename && apiStatus === 'ok'" class="panel-hint">
+        未找到可用 DOM 文件，请先在「数据管理」上传 DOM（.tif/.tiff）。
+      </p>
     </section>
 
     <section class="group">
@@ -360,20 +370,23 @@ onActivated(async () => {
         role="button"
         tabindex="0"
         :aria-busy="regeneratingVis || segmenting"
-        :aria-disabled="apiStatus !== 'ok' || regeneratingVis || segmenting"
-        @click="apiStatus === 'ok' && !regeneratingVis && !segmenting && openResultGallery()"
+        :aria-disabled="apiStatus !== 'ok' || regeneratingVis || segmenting || !hasDomFilename"
+        @click="apiStatus === 'ok' && !regeneratingVis && !segmenting && hasDomFilename && openResultGallery()"
         @keydown="onResultPanelKeydown"
       >
         
         <button
           type="button"
           class="btn btn-secondary"
-          :disabled="apiStatus !== 'ok' || regeneratingVis || segmenting"
+          :disabled="apiStatus !== 'ok' || regeneratingVis || segmenting || !hasDomFilename"
           @click.stop="openResultGallery"
         >
           {{ segmenting ? '分割进行中，请稍候…' : regeneratingVis ? '正在准备可视化…' : '点击打开预览' }}
         </button>
       </div>
+      <p v-if="!hasDomFilename && apiStatus === 'ok'" class="panel-hint">
+        未找到可用 DOM 文件，暂无法打开预览。
+      </p>
     </section>
 
     <div v-if="regeneratingVis && visProgress" class="vis-progress-block">
